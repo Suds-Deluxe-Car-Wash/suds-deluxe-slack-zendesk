@@ -1,0 +1,11 @@
+{
+  "description": "Maps Slack channel IDs to Zendesk configuration",
+  "allowed_channels": [
+    {
+      "channel_id": "C0A8L9AQZ1V",
+      "channel_name": "test-zendesk-slack-integration",
+      "description": "Testing Zendesk-Slack custom integration"
+    }
+  ],
+  "notes": "Replace channel_id values with your actual Slack channel IDs. Find them by right-clicking a channel -> View channel details -> Copy ID (at bottom)"
+}

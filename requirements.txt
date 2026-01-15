@@ -1,0 +1,21 @@
+# Slack SDK for Python
+slack-bolt==1.18.0
+slack-sdk==3.27.0
+
+# Zendesk Python client
+zenpy==2.0.50
+
+# Web framework
+flask==3.0.0
+
+# Environment variable management
+python-dotenv==1.0.0
+
+# HTTP requests (used by zenpy)
+requests==2.31.0
+
+# Data validation
+pydantic==2.5.0
+
+# WSGI server for production
+gunicorn==21.2.0
