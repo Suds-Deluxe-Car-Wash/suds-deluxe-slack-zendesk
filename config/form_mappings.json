@@ -1,0 +1,26 @@
+{
+  "description": "Maps Slack workflow forms to Zendesk ticket forms and custom fields",
+  "forms": {
+    "customer_issues_tracker": {
+      "name": "Customer Issues Tracker",
+      "zendesk_form_id": "45508825246107",
+      "description": "Main customer support issues form",
+      "field_mappings": {
+        "Location": "43077248092699",
+        "Customer Name": "43945003565979",
+        "Customer Identifying information Type": "45508623405979",
+        "Customer Identifying Information": "45508633227163",
+        "Customer Email": "43079576841371",
+        "Customer Issue Type": "45508647518619",
+        "Customer issue detail": "45508641666075",
+        "If refund please specify the amount": "43083324341147",
+        "Person in-charge 1": "45508676218779",
+        "Person in-charge 2": "45508707697691",
+        "Person in-charge 3": "45508684544667"
+      },
+      "subject_template": "Customer Issue: {Customer Issue Type}",
+      "identification_fields": ["Location", "Customer Name"]
+    }
+  },
+  "notes": "Add new form configurations here as 'form_key' objects. The field_mappings use exact Slack field names as keys and Zendesk custom field IDs as values."
+}

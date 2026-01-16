@@ -27,7 +27,8 @@ class ZendeskHandler:
     def create_ticket_from_slack_message(
         self,
         message_data: Dict[str, Any],
-        custom_fields: Optional[Dict[str, Any]] = None
+        custom_fields: Optional[Dict[str, Any]] = None,
+        ticket_form_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a Zendesk ticket from Slack message data.
@@ -35,6 +36,7 @@ class ZendeskHandler:
         Args:
             message_data: Parsed data from Slack workflow message
             custom_fields: Dictionary of custom field IDs to values
+            ticket_form_id: Optional override for ticket form ID
         
         Returns:
             Dictionary with ticket_id and ticket_url
@@ -51,18 +53,27 @@ class ZendeskHandler:
                     for field_id, value in custom_fields.items()
                 ]
             
+            # Use provided form ID (required since we removed it from .env)
+            if not ticket_form_id:
+                raise ValueError("ticket_form_id is required")
+            
             # Create ticket object
             ticket = Ticket(
                 subject=message_data.get("subject", "Ticket from Slack"),
                 description=description,
                 priority=message_data.get("priority", "normal"),
-                ticket_form_id=int(Config.ZENDESK_TICKET_FORM_ID),
+                ticket_form_id=int(ticket_form_id),
                 custom_fields=custom_field_objects if custom_field_objects else None,
                 tags=["slack", "automated"]
+                # TODO: Add requester once we verify custom fields work
+                # requester={"name": "Slack Automation", "email": Config.ZENDESK_AUTOMATION_EMAIL}
             )
             
             # Submit ticket to Zendesk
-            created_ticket = self.client.tickets.create(ticket)
+            ticket_audit = self.client.tickets.create(ticket)
+            
+            # Extract the ticket from the audit response
+            created_ticket = ticket_audit.ticket
             
             logger.info(f"Created Zendesk ticket #{created_ticket.id}")
             

@@ -38,10 +38,10 @@ handler = SlackRequestHandler(bolt_app)
 slack_handler = SlackHandler()
 
 
-@bolt_app.shortcut("create_zendesk_ticket")
+@bolt_app.shortcut("create_custom_zendesk_ticket")
 def handle_create_ticket_shortcut(ack, shortcut, client):
     """
-    Handle the 'create_zendesk_ticket' message shortcut.
+    Handle the 'create_custom_zendesk_ticket' message shortcut.
     
     This is triggered when a user clicks the message action menu
     and selects "Create Zendesk Ticket".

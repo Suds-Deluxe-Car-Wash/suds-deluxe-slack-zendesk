@@ -4,7 +4,7 @@ import re
 from typing import Dict, Any, Optional, List
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from src.config import Config, is_channel_allowed
+from src.config import Config, is_channel_allowed, get_form_config_for_channel
 from src.zendesk_handler import ZendeskHandler
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,17 @@ class SlackHandler:
                     "error": "This integration is not enabled for this channel."
                 }
             
+            # Get form configuration for this channel
+            form_config = get_form_config_for_channel(channel_id)
+            if not form_config:
+                logger.error(f"No form configuration found for channel {channel_id}")
+                return {
+                    "success": False,
+                    "error": "No form configuration found for this channel."
+                }
+            
+            logger.info(f"Using form: {form_config['name']}")
+            
             # Parse the Slack workflow message
             parsed_data = self.parse_workflow_message(message, channel_id)
             
@@ -52,8 +63,19 @@ class SlackHandler:
                     "error": "Could not parse message data. Please ensure this is a workflow form message."
                 }
             
-            # Create Zendesk ticket
-            ticket_result = self.zendesk_handler.create_ticket_from_slack_message(parsed_data)
+            # Build custom fields mapping for Zendesk using form config
+            custom_fields = self._build_zendesk_custom_fields(parsed_data, form_config)
+            
+            # Build subject using form template
+            subject = self._build_ticket_subject(parsed_data, form_config)
+            parsed_data["subject"] = subject
+            
+            # Create Zendesk ticket with custom fields and specific form
+            ticket_result = self.zendesk_handler.create_ticket_from_slack_message(
+                parsed_data,
+                custom_fields=custom_fields,
+                ticket_form_id=form_config.get("zendesk_form_id")
+            )
             
             if not ticket_result.get("success"):
                 return {
@@ -70,7 +92,7 @@ class SlackHandler:
                 user_id=user_id
             )
             
-            logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack message")
+            logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack message using form '{form_config['name']}'")
             
             return {
                 "success": True,
@@ -84,6 +106,71 @@ class SlackHandler:
                 "success": False,
                 "error": str(e)
             }
+    
+    def _build_zendesk_custom_fields(
+        self, 
+        parsed_data: Dict[str, Any],
+        form_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build Zendesk custom fields dictionary from parsed Slack data.
+        
+        Args:
+            parsed_data: Parsed data from Slack workflow message
+            form_config: Form configuration with field mappings
+        
+        Returns:
+            Dictionary mapping Zendesk field IDs to values
+        """
+        custom_fields = {}
+        additional_fields = parsed_data.get("additional_fields", {})
+        field_mappings = form_config.get("field_mappings", {})
+        
+        logger.info(f"Parsed fields from Slack: {list(additional_fields.keys())}")
+        
+        for slack_field_name, zendesk_field_id in field_mappings.items():
+            if slack_field_name in additional_fields:
+                value = additional_fields[slack_field_name]
+                # Remove Slack user mentions (e.g., <@U12345> becomes just the username)
+                value = re.sub(r'<@[A-Z0-9]+>', '', value).strip()
+                custom_fields[zendesk_field_id] = value
+                logger.info(f"[{form_config['name']}] Mapped '{slack_field_name}' → Field ID {zendesk_field_id}: {value}")
+            else:
+                logger.warning(f"[{form_config['name']}] Field '{slack_field_name}' not found in Slack message")
+        
+        logger.info(f"Total custom fields mapped: {len(custom_fields)}")
+        return custom_fields
+    
+    def _build_ticket_subject(
+        self,
+        parsed_data: Dict[str, Any],
+        form_config: Dict[str, Any]
+    ) -> str:
+        """
+        Build ticket subject using form's subject template.
+        
+        Args:
+            parsed_data: Parsed data from Slack workflow message
+            form_config: Form configuration
+        
+        Returns:
+            Formatted subject line
+        """
+        subject_template = form_config.get("subject_template", "Ticket from Slack")
+        additional_fields = parsed_data.get("additional_fields", {})
+        
+        # Replace placeholders in template with actual values
+        subject = subject_template
+        for field_name, value in additional_fields.items():
+            placeholder = f"{{{field_name}}}"
+            if placeholder in subject:
+                subject = subject.replace(placeholder, str(value))
+        
+        # If template still has unreplaced placeholders, use default
+        if "{" in subject:
+            return f"Customer Issue from {parsed_data.get('channel_name', 'Slack')}"
+        
+        return subject
     
     def parse_workflow_message(
         self,
@@ -103,6 +190,13 @@ class SlackHandler:
             Dictionary with parsed message data or None if parsing fails
         """
         try:
+            # TEMPORARY DEBUG - Remove after fixing field mapping
+            import json
+            logger.info("=" * 80)
+            logger.info("RAW SLACK MESSAGE:")
+            logger.info(json.dumps(message, indent=2))
+            logger.info("=" * 80)
+            
             parsed_data = {
                 "message_link": self._build_message_link(channel_id, message.get("ts")),
                 "reporter_name": self._get_user_name(message.get("user")),
@@ -117,6 +211,8 @@ class SlackHandler:
             # Fall back to parsing text
             elif "text" in message:
                 parsed_data.update(self._parse_text(message["text"]))
+            
+            logger.info(f"PARSED DATA - additional_fields: {parsed_data.get('additional_fields')}")
             
             return parsed_data
             
@@ -149,6 +245,10 @@ class SlackHandler:
                 if not parsed["subject"]:
                     parsed["subject"] = text
             
+            # Rich text blocks (Slack workflow builder format)
+            elif block_type == "rich_text":
+                self._parse_rich_text_block(block, parsed)
+            
             # Section blocks contain field data
             elif block_type == "section":
                 if "fields" in block:
@@ -162,6 +262,57 @@ class SlackHandler:
                     self._extract_field_from_text(field_text, parsed)
         
         return parsed
+    
+    def _parse_rich_text_block(self, block: Dict[str, Any], parsed: Dict[str, Any]) -> None:
+        """
+        Parse a rich_text block from Slack workflow builder.
+        
+        Slack workflow messages use rich_text blocks where:
+        - Bold text is the field name
+        - Non-bold text after it is the field value
+        
+        Args:
+            block: Rich text block object
+            parsed: Dictionary to update with extracted fields
+        """
+        elements = block.get("elements", [])
+        
+        for element in elements:
+            if element.get("type") == "rich_text_section":
+                section_elements = element.get("elements", [])
+                
+                current_field = None
+                current_value = []
+                
+                for elem in section_elements:
+                    elem_type = elem.get("type")
+                    
+                    # Bold text is a field name
+                    if elem_type == "text" and elem.get("style", {}).get("bold"):
+                        # Save previous field
+                        if current_field and current_value:
+                            value = " ".join(current_value).strip()
+                            parsed["additional_fields"][current_field] = value
+                        
+                        # Start new field
+                        current_field = elem.get("text", "").strip()
+                        current_value = []
+                    
+                    # Regular text is a value
+                    elif elem_type == "text" and current_field:
+                        text = elem.get("text", "")
+                        if text.strip() and text != "\n":
+                            current_value.append(text.strip())
+                    
+                    # User mention
+                    elif elem_type == "user" and current_field:
+                        user_id = elem.get("user_id", "")
+                        current_value.append(f"<@{user_id}>")
+                
+                # Save last field
+                if current_field and current_value:
+                    value = " ".join(current_value).strip()
+                    parsed["additional_fields"][current_field] = value
     
     def _parse_text(self, text: str) -> Dict[str, Any]:
         """

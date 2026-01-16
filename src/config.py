@@ -2,7 +2,7 @@
 import os
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,7 +20,7 @@ class Config:
     ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
     ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
     ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
-    ZENDESK_TICKET_FORM_ID = os.getenv("ZENDESK_TICKET_FORM_ID")
+    ZENDESK_AUTOMATION_EMAIL = os.getenv("ZENDESK_AUTOMATION_EMAIL", "slack-automation@sudsdeluxecarwash.com")
     
     # Server Configuration
     PORT = int(os.getenv("PORT", "3000"))
@@ -36,8 +36,7 @@ class Config:
             "SLACK_SIGNING_SECRET",
             "ZENDESK_SUBDOMAIN",
             "ZENDESK_EMAIL",
-            "ZENDESK_API_TOKEN",
-            "ZENDESK_TICKET_FORM_ID"
+            "ZENDESK_API_TOKEN"
         ]
         
         for var in required_vars:
@@ -65,6 +64,19 @@ def load_channel_mappings() -> Dict[str, Any]:
         raise Exception(f"Invalid JSON in channel mappings: {e}")
 
 
+def load_form_mappings() -> Dict[str, Any]:
+    """Load form mappings from JSON configuration file."""
+    config_path = Path(__file__).parent.parent / "config" / "form_mappings.json"
+    
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise Exception(f"Form mappings file not found at {config_path}")
+    except json.JSONDecodeError as e:
+        raise Exception(f"Invalid JSON in form mappings: {e}")
+
+
 def get_allowed_channel_ids() -> List[str]:
     """Get list of allowed Slack channel IDs."""
     mappings = load_channel_mappings()
@@ -74,3 +86,18 @@ def get_allowed_channel_ids() -> List[str]:
 def is_channel_allowed(channel_id: str) -> bool:
     """Check if a channel ID is in the allowed list."""
     return channel_id in get_allowed_channel_ids()
+
+
+def get_form_config_for_channel(channel_id: str) -> Optional[Dict[str, Any]]:
+    """Get form configuration for a specific channel."""
+    channel_mappings = load_channel_mappings()
+    form_mappings = load_form_mappings()
+    
+    # Find the channel
+    for channel in channel_mappings.get("allowed_channels", []):
+        if channel["channel_id"] == channel_id:
+            form_key = channel.get("form_key")
+            if form_key and form_key in form_mappings.get("forms", {}):
+                return form_mappings["forms"][form_key]
+    
+    return None

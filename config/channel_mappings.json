@@ -1,11 +1,12 @@
 {
-  "description": "Maps Slack channel IDs to Zendesk configuration",
+  "description": "Maps Slack channel IDs to Zendesk configuration and forms",
   "allowed_channels": [
     {
       "channel_id": "C0A8L9AQZ1V",
       "channel_name": "test-zendesk-slack-integration",
-      "description": "Testing Zendesk-Slack custom integration"
+      "description": "Testing Zendesk-Slack custom integration",
+      "form_key": "customer_issues_tracker"
     }
   ],
-  "notes": "Replace channel_id values with your actual Slack channel IDs. Find them by right-clicking a channel -> View channel details -> Copy ID (at bottom)"
+  "notes": "Each channel is assigned a form_key that references a form in form_mappings.json. Replace channel_id values with your actual Slack channel IDs. Find them by right-clicking a channel -> View channel details -> Copy ID (at bottom)"
 }
