@@ -15,7 +15,7 @@ python-dotenv==1.0.0
 requests==2.31.0
 
 # Data validation
-pydantic==2.5.0
+pydantic>=2.10.0
 
 # WSGI server for production
 gunicorn==21.2.0
