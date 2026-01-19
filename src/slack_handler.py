@@ -6,6 +6,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from src.config import Config, is_channel_allowed, get_form_config_for_channel
 from src.zendesk_handler import ZendeskHandler
+from src.thread_store import ThreadMappingStore
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ class SlackHandler:
         """Initialize Slack client with bot token."""
         self.client = WebClient(token=Config.SLACK_BOT_TOKEN)
         self.zendesk_handler = ZendeskHandler()
+        self.thread_store = ThreadMappingStore()
         logger.info("Slack client initialized successfully")
     
     def handle_message_shortcut(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -92,6 +94,16 @@ class SlackHandler:
                 user_id=user_id
             )
             
+            # Store thread mapping for future replies
+            self.thread_store.store_mapping(
+                thread_ts=message.get("ts"),
+                ticket_id=ticket_result["ticket_id"],
+                channel_id=channel_id
+            )
+            
+            # Cleanup old mappings (30 days)
+            self.thread_store.cleanup_old_mappings(days=30)
+            
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack message using form '{form_config['name']}'")
             
             return {
@@ -131,10 +143,23 @@ class SlackHandler:
         for slack_field_name, zendesk_field_id in field_mappings.items():
             if slack_field_name in additional_fields:
                 value = additional_fields[slack_field_name]
-                # Remove Slack user mentions (e.g., <@U12345> becomes just the username)
-                value = re.sub(r'<@[A-Z0-9]+>', '', value).strip()
-                custom_fields[zendesk_field_id] = value
-                logger.info(f"[{form_config['name']}] Mapped '{slack_field_name}' → Field ID {zendesk_field_id}: {value}")
+                
+                # Handle Slack user mentions - replace with actual username
+                if '<@' in value:
+                    # Extract user IDs and replace with usernames
+                    user_ids = re.findall(r'<@([A-Z0-9]+)>', value)
+                    for user_id in user_ids:
+                        username = self._get_user_name(user_id)
+                        value = value.replace(f'<@{user_id}>', username)
+                
+                value = value.strip()
+                
+                # Don't send empty values to Zendesk
+                if value:
+                    custom_fields[zendesk_field_id] = value
+                    logger.info(f"[{form_config['name']}] Mapped '{slack_field_name}' → Field ID {zendesk_field_id}: {value}")
+                else:
+                    logger.warning(f"[{form_config['name']}] Field '{slack_field_name}' has empty value, skipping")
             else:
                 logger.warning(f"[{form_config['name']}] Field '{slack_field_name}' not found in Slack message")
         
@@ -219,6 +244,44 @@ class SlackHandler:
         except Exception as e:
             logger.error(f"Error parsing workflow message: {e}", exc_info=True)
             return None
+    
+    def add_thread_reply_to_ticket(self, message_event: Dict[str, Any]) -> bool:
+        """Add a Slack thread reply as an internal note to the corresponding Zendesk ticket.
+        
+        Args:
+            message_event: Slack message event from a thread reply
+            
+        Returns:
+            True if comment added successfully, False otherwise
+        """
+        try:
+            thread_ts = message_event.get("thread_ts")
+            user_id = message_event.get("user")
+            text = message_event.get("text", "")
+            
+            # Get ticket ID from thread mapping
+            ticket_id = self.thread_store.get_ticket_id(thread_ts)
+            if not ticket_id:
+                logger.warning(f"No ticket found for thread {thread_ts}")
+                return False
+            
+            # Get user's display name
+            user_name = self._get_user_name(user_id)
+            
+            # Format comment with username and message
+            comment_text = f"💬 Thread Reply from {user_name}:\n\n{text}"
+            
+            # Add as internal note to Zendesk ticket
+            success = self.zendesk_handler.add_comment_to_ticket(ticket_id, comment_text)
+            
+            if success:
+                logger.info(f"Added thread reply to ticket #{ticket_id} from user {user_name}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Failed to add thread reply to ticket: {e}")
+            return False
     
     def _parse_blocks(self, blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         """

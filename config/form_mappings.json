@@ -6,14 +6,14 @@
       "zendesk_form_id": "45508825246107",
       "description": "Main customer support issues form",
       "field_mappings": {
-        "Location": "43077248092699",
+        "Location": "45554499814299",
         "Customer Name": "43945003565979",
-        "Customer Identifying information Type": "45508623405979",
+        "Customer Identifying information Type": "45554509358235",
         "Customer Identifying Information": "45508633227163",
         "Customer Email": "43079576841371",
         "Customer Issue Type": "45508647518619",
         "Customer issue detail": "45508641666075",
-        "If refund please specify the amount": "43083324341147",
+        "If refund please specify the amount": "45554778962459",
         "Person in-charge 1": "45508676218779",
         "Person in-charge 2": "45508707697691",
         "Person in-charge 3": "45508684544667"

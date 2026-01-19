@@ -2,7 +2,7 @@
 import logging
 from typing import Dict, Any, Optional
 from zenpy import Zenpy
-from zenpy.lib.api_objects import Ticket, CustomField, Comment
+from zenpy.lib.api_objects import Ticket, CustomField, Comment, User
 from src.config import Config
 
 logger = logging.getLogger(__name__)
@@ -64,9 +64,8 @@ class ZendeskHandler:
                 priority=message_data.get("priority", "normal"),
                 ticket_form_id=int(ticket_form_id),
                 custom_fields=custom_field_objects if custom_field_objects else None,
+                requester=User(name="Slack Automation", email=Config.ZENDESK_AUTOMATION_EMAIL),
                 tags=["slack", "automated"]
-                # TODO: Add requester once we verify custom fields work
-                # requester={"name": "Slack Automation", "email": Config.ZENDESK_AUTOMATION_EMAIL}
             )
             
             # Submit ticket to Zendesk

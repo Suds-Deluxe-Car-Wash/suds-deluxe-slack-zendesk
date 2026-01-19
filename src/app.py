@@ -81,6 +81,58 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         )
 
 
+@bolt_app.event("message")
+def handle_message_events(event, client, logger):
+    """
+    Handle message events to capture thread replies.
+    
+    When a user replies in a thread where a Zendesk ticket was created,
+    add that reply as an internal note to the corresponding ticket.
+    """
+    try:
+        # Skip messages that don't have thread_ts (not in a thread)
+        if "thread_ts" not in event:
+            return
+        
+        # Skip if this is the parent message itself (thread_ts == ts)
+        if event.get("thread_ts") == event.get("ts"):
+            return
+        
+        # Check if channel is allowed (only process configured channels)
+        channel_id = event.get("channel")
+        if not channel_id:
+            return
+        
+        from src.config import is_channel_allowed
+        if not is_channel_allowed(channel_id):
+            logger.debug(f"Skipping message from non-allowed channel {channel_id}")
+            return
+        
+        # Skip bot messages to avoid posting our own ticket links to Zendesk
+        if "bot_id" in event or event.get("subtype") == "bot_message":
+            logger.debug(f"Skipping bot message in thread {event.get('thread_ts')}")
+            return
+        
+        # Get event_id for deduplication
+        event_id = event.get("event_id") or event.get("client_msg_id")
+        if event_id and slack_handler.thread_store.is_event_processed(event_id):
+            logger.debug(f"Event {event_id} already processed, skipping")
+            return
+        
+        # This is a user reply in a thread - try to add to Zendesk
+        success = slack_handler.add_thread_reply_to_ticket(event)
+        
+        # Mark event as processed to prevent duplicates
+        if event_id:
+            slack_handler.thread_store.mark_event_processed(event_id)
+        
+        if success:
+            logger.info(f"Thread reply added to Zendesk from thread {event.get('thread_ts')}")
+        
+    except Exception as e:
+        logger.error(f"Error processing message event: {e}", exc_info=True)
+
+
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
     """
