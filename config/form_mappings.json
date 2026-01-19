@@ -19,7 +19,14 @@
         "Person in-charge 3": "45508684544667"
       },
       "subject_template": "Customer Issue: {Customer Issue Type}",
-      "identification_fields": ["Location", "Customer Name"]
+      "identification_fields": ["Location", "Customer Name"],
+      "group_mappings": {
+        "field_name": "Customer Issue Type",
+        "rules": {
+          "Cancel": "42987935763867",
+          "default": "42836454078875"
+        }
+      }
     }
   },
   "notes": "Add new form configurations here as 'form_key' objects. The field_mappings use exact Slack field names as keys and Zendesk custom field IDs as values."

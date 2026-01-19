@@ -28,7 +28,8 @@ class ZendeskHandler:
         self,
         message_data: Dict[str, Any],
         custom_fields: Optional[Dict[str, Any]] = None,
-        ticket_form_id: Optional[str] = None
+        ticket_form_id: Optional[str] = None,
+        group_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Create a Zendesk ticket from Slack message data.
@@ -37,6 +38,7 @@ class ZendeskHandler:
             message_data: Parsed data from Slack workflow message
             custom_fields: Dictionary of custom field IDs to values
             ticket_form_id: Optional override for ticket form ID
+            group_id: Optional Zendesk group ID to assign ticket to
         
         Returns:
             Dictionary with ticket_id and ticket_url
@@ -65,6 +67,7 @@ class ZendeskHandler:
                 ticket_form_id=int(ticket_form_id),
                 custom_fields=custom_field_objects if custom_field_objects else None,
                 requester=User(name="Slack Automation", email=Config.ZENDESK_AUTOMATION_EMAIL),
+                group_id=group_id,
                 tags=["slack", "automated"]
             )
             

@@ -72,11 +72,15 @@ class SlackHandler:
             subject = self._build_ticket_subject(parsed_data, form_config)
             parsed_data["subject"] = subject
             
+            # Determine group assignment based on issue type
+            group_id = self._determine_group(parsed_data, form_config)
+            
             # Create Zendesk ticket with custom fields and specific form
             ticket_result = self.zendesk_handler.create_ticket_from_slack_message(
                 parsed_data,
                 custom_fields=custom_fields,
-                ticket_form_id=form_config.get("zendesk_form_id")
+                ticket_form_id=form_config.get("zendesk_form_id"),
+                group_id=group_id
             )
             
             if not ticket_result.get("success"):
@@ -282,6 +286,48 @@ class SlackHandler:
         except Exception as e:
             logger.error(f"Failed to add thread reply to ticket: {e}")
             return False
+    
+    def _determine_group(self, parsed_data: Dict[str, Any], form_config: Dict[str, Any]) -> Optional[int]:
+        """Determine Zendesk group ID based on field values.
+        
+        Args:
+            parsed_data: Parsed Slack message data
+            form_config: Form configuration with group mappings
+            
+        Returns:
+            Zendesk group ID or None
+        """
+        try:
+            group_mappings = form_config.get("group_mappings")
+            if not group_mappings:
+                return None
+            
+            field_name = group_mappings.get("field_name")
+            rules = group_mappings.get("rules", {})
+            
+            # Get the field value from parsed data
+            field_value = parsed_data.get("additional_fields", {}).get(field_name)
+            
+            if not field_value:
+                logger.warning(f"Field '{field_name}' not found for group assignment")
+                return int(rules.get("default")) if rules.get("default") else None
+            
+            # Check if there's a specific rule for this value
+            group_id = rules.get(field_value)
+            
+            # Fall back to default if no specific rule found
+            if not group_id:
+                group_id = rules.get("default")
+            
+            if group_id:
+                logger.info(f"Assigning to group {group_id} based on '{field_name}' = '{field_value}'")
+                return int(group_id)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error determining group: {e}")
+            return None
     
     def _parse_blocks(self, blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
