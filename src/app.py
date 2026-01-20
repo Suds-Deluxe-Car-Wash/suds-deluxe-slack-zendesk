@@ -6,6 +6,7 @@ from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from src.config import Config
 from src.slack_handler import SlackHandler
+from src.zendesk_webhook_handler import ZendeskWebhookHandler
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +37,9 @@ handler = SlackRequestHandler(bolt_app)
 
 # Initialize Slack handler
 slack_handler = SlackHandler()
+
+# Initialize Zendesk webhook handler
+zendesk_webhook_handler = ZendeskWebhookHandler()
 
 
 @bolt_app.shortcut("create_custom_zendesk_ticket")
@@ -166,6 +170,32 @@ def slack_events():
     This endpoint receives all Slack events including message shortcuts.
     """
     return handler.handle(request)
+
+
+@flask_app.route("/zendesk/webhook", methods=["POST"])
+def zendesk_webhook():
+    """
+    Handle Zendesk webhook requests.
+    
+    This endpoint receives Zendesk ticket updates and posts them to Slack.
+    """
+    try:
+        payload = request.get_json()
+        if not payload:
+            logger.warning("Received empty Zendesk webhook payload")
+            return jsonify({"error": "Empty payload"}), 400
+        
+        # Process the webhook
+        result = zendesk_webhook_handler.handle_webhook(payload)
+        
+        if result.get("success"):
+            return jsonify({"status": "ok"}), 200
+        else:
+            return jsonify({"error": result.get("error", "Unknown error")}), 500
+            
+    except Exception as e:
+        logger.error(f"Error processing Zendesk webhook: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @flask_app.route("/health", methods=["GET"])

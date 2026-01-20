@@ -114,6 +114,36 @@ class ThreadMappingStore:
             logger.error(f"Failed to get ticket ID for thread {thread_ts}: {e}")
             return None
     
+    def get_thread_info(self, ticket_id: int) -> Optional[dict]:
+        """
+        Retrieve Slack thread info for a given Zendesk ticket (reverse lookup).
+        
+        Args:
+            ticket_id: Zendesk ticket ID
+            
+        Returns:
+            Dictionary with thread_ts and channel_id if found, None otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT thread_ts, channel_id FROM thread_mappings 
+                    WHERE ticket_id = ?
+                """, (ticket_id,))
+                
+                result = cursor.fetchone()
+                if result:
+                    return {
+                        "thread_ts": result[0],
+                        "channel_id": result[1]
+                    }
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get thread info for ticket {ticket_id}: {e}")
+            return None
+    
     def is_event_processed(self, event_id: str) -> bool:
         """
         Check if an event has already been processed (deduplication).
