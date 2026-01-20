@@ -97,8 +97,13 @@ class ZendeskWebhookHandler:
                 logger.debug("Skipping comment from Slack Automation (loop prevention)")
                 return messages
             
-            is_public = current_comment.get("public", True)
+            # Skip comments that originated from Slack (have our signature)
             body = current_comment.get("body", "").strip()
+            if "[Posted from Slack]" in body:
+                logger.debug("Skipping comment from Slack thread (loop prevention)")
+                return messages
+            
+            is_public = current_comment.get("public", True)
             
             if body:
                 if is_public:

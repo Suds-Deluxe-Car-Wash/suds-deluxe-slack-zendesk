@@ -272,8 +272,8 @@ class SlackHandler:
             # Get user's display name
             user_name = self._get_user_name(user_id)
             
-            # Format comment with username and message
-            comment_text = f"💬 Thread Reply from {user_name}:\n\n{text}"
+            # Format comment with username, message, and signature to prevent webhook loops
+            comment_text = f"💬 Thread Reply from {user_name}:\n\n{text}\n\n---\n[Posted from Slack]"
             
             # Add as internal note to Zendesk ticket
             success = self.zendesk_handler.add_comment_to_ticket(ticket_id, comment_text)
