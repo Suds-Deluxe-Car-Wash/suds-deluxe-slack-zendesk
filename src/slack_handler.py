@@ -272,6 +272,13 @@ class SlackHandler:
             # Get user's display name
             user_name = self._get_user_name(user_id)
             
+            # Replace Slack user mentions with actual usernames
+            if '<@' in text:
+                user_ids = re.findall(r'<@([A-Z0-9]+)>', text)
+                for mentioned_user_id in user_ids:
+                    mentioned_username = self._get_user_name(mentioned_user_id)
+                    text = text.replace(f'<@{mentioned_user_id}>', f'@{mentioned_username}')
+            
             # Format comment with username, message, and signature to prevent webhook loops
             comment_text = f"💬 Thread Reply from {user_name}:\n\n{text}\n\n---\n[Posted from Slack]"
             
