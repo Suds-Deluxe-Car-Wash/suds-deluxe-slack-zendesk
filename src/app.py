@@ -65,10 +65,11 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         else:
             # Send ephemeral error message to user
             error_message = result.get("error", "Unknown error occurred")
+            user_friendly_message = _get_user_friendly_error(error_message)
             client.chat_postEphemeral(
                 channel=shortcut["channel"]["id"],
                 user=shortcut["user"]["id"],
-                text=f"❌ Failed to create ticket: {error_message}"
+                text=f"❌ {user_friendly_message}\n\n_If this continues, please contact support._"
             )
             logger.error(f"Ticket creation failed: {error_message}")
             
@@ -77,8 +78,32 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         client.chat_postEphemeral(
             channel=shortcut["channel"]["id"],
             user=shortcut["user"]["id"],
-            text=f"❌ An error occurred while creating the ticket. Please try again or contact support."
+            text=f"❌ Unable to create ticket at the moment. Please try again in a few seconds.\n\n_If this continues, please contact support._"
         )
+
+
+def _get_user_friendly_error(error_message: str) -> str:
+    """Convert technical error messages to user-friendly ones."""
+    error_lower = error_message.lower()
+    
+    # Connection errors (likely cold start on free tier)
+    if "connection" in error_lower or "reset by peer" in error_lower or "timeout" in error_lower:
+        return "The ticket system is starting up. Please try again in a moment."
+    
+    # Channel not allowed
+    if "not allowed" in error_lower or "channel" in error_lower:
+        return "Tickets cannot be created from this channel."
+    
+    # Parsing errors
+    if "parse" in error_lower or "workflow" in error_lower:
+        return "Could not read the message format. Please use the workflow form."
+    
+    # Zendesk API errors
+    if "zendesk" in error_lower or "api" in error_lower:
+        return "Unable to connect to the ticketing system. Please try again."
+    
+    # Generic fallback
+    return "Failed to create ticket. Please try again."
 
 
 @bolt_app.event("message")
