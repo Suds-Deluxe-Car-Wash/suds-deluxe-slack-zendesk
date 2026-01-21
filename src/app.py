@@ -113,33 +113,19 @@ def _get_user_friendly_error(error_message: str) -> str:
 @bolt_app.event("message")
 def handle_message_events(event, client, logger):
     """
-    Handle message events to capture thread replies.
-    
-    When a user replies in a thread where a Zendesk ticket was created,
-    add that reply as an internal note to the corresponding ticket.
+    Handle message events for:
+    1. Auto-creating Zendesk tickets from workflow form submissions
+    2. Adding thread replies as internal notes to existing tickets
     """
     try:
-        # Skip messages that don't have thread_ts (not in a thread)
-        if "thread_ts" not in event:
-            return
-        
-        # Skip if this is the parent message itself (thread_ts == ts)
-        if event.get("thread_ts") == event.get("ts"):
-            return
-        
-        # Check if channel is allowed (only process configured channels)
         channel_id = event.get("channel")
         if not channel_id:
             return
         
+        # Check if channel is allowed (only process configured channels)
         from src.config import is_channel_allowed
         if not is_channel_allowed(channel_id):
             logger.debug(f"Skipping message from non-allowed channel {channel_id}")
-            return
-        
-        # Skip bot messages to avoid posting our own ticket links to Zendesk
-        if "bot_id" in event or event.get("subtype") == "bot_message":
-            logger.debug(f"Skipping bot message in thread {event.get('thread_ts')}")
             return
         
         # Get event_id for deduplication
@@ -148,18 +134,92 @@ def handle_message_events(event, client, logger):
             logger.debug(f"Event {event_id} already processed, skipping")
             return
         
-        # This is a user reply in a thread - try to add to Zendesk
-        success = slack_handler.add_thread_reply_to_ticket(event)
+        # Determine if this is a workflow message or a thread reply
+        is_thread_reply = ("thread_ts" in event and 
+                          event.get("thread_ts") != event.get("ts"))
         
-        # Mark event as processed to prevent duplicates
-        if event_id:
-            slack_handler.thread_store.mark_event_processed(event_id)
+        if is_thread_reply:
+            # Skip bot messages to avoid posting our own ticket links to Zendesk
+            if "bot_id" in event or event.get("subtype") == "bot_message":
+                logger.debug(f"Skipping bot message in thread {event.get('thread_ts')}")
+                return
+            
+            # This is a user reply in a thread - try to add to Zendesk
+            success = slack_handler.add_thread_reply_to_ticket(event)
+            
+            # Mark event as processed to prevent duplicates
+            if event_id:
+                slack_handler.thread_store.mark_event_processed(event_id)
+            
+            if success:
+                logger.info(f"Thread reply added to Zendesk from thread {event.get('thread_ts')}")
         
-        if success:
-            logger.info(f"Thread reply added to Zendesk from thread {event.get('thread_ts')}")
+        else:
+            # This is a new message (not a thread reply)
+            # Check if it's a workflow message that should auto-create a ticket
+            if _is_workflow_message(event):
+                logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
+                
+                # Automatically create ticket from workflow message
+                result = slack_handler.handle_workflow_message(
+                    message=event,
+                    channel_id=channel_id,
+                    user_id=event.get("user")
+                )
+                
+                # Mark event as processed to prevent duplicates
+                if event_id:
+                    slack_handler.thread_store.mark_event_processed(event_id)
+                
+                if result.get("success"):
+                    logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
+                else:
+                    logger.error(f"Failed to auto-create ticket: {result.get('error')}")
         
     except Exception as e:
         logger.error(f"Error processing message event: {e}", exc_info=True)
+
+
+def _is_workflow_message(event: dict) -> bool:
+    """
+    Detect if a message is from Slack Workflow Builder.
+    
+    Workflow messages typically have:
+    - bot_profile field (workflow bot)
+    - Structured blocks (rich_text)
+    - Not a thread reply
+    
+    Args:
+        event: Slack message event
+    
+    Returns:
+        True if message is from a workflow, False otherwise
+    """
+    # Must have blocks (workflow forms use structured blocks)
+    if "blocks" not in event or not event["blocks"]:
+        return False
+    
+    # Must be from a bot (workflows post as bots)
+    if "bot_id" not in event and event.get("subtype") != "bot_message":
+        return False
+    
+    # Check for workflow-specific indicators
+    # Workflow Builder messages often have bot_profile with workflow data
+    if "bot_profile" in event:
+        bot_name = event.get("bot_profile", {}).get("name", "")
+        # Workflow Builder creates bots with specific naming patterns
+        if "workflow" in bot_name.lower() or "Workflow" in bot_name:
+            return True
+    
+    # Additional check: workflow messages have rich_text blocks with specific structure
+    for block in event.get("blocks", []):
+        if block.get("type") == "rich_text":
+            # Workflow forms use rich_text blocks with section elements
+            elements = block.get("elements", [])
+            if elements and any(elem.get("type") == "rich_text_section" for elem in elements):
+                return True
+    
+    return False
 
 
 @flask_app.route("/slack/events", methods=["POST"])

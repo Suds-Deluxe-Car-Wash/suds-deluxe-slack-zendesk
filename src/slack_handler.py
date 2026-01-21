@@ -21,25 +21,22 @@ class SlackHandler:
         self.thread_store = ThreadMappingStore()
         logger.info("Slack client initialized successfully")
     
-    def handle_message_shortcut(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_workflow_message(self, message: Dict[str, Any], channel_id: str, user_id: str = None) -> Dict[str, Any]:
         """
-        Handle message shortcut callback from Slack.
+        Handle workflow message and create Zendesk ticket.
         
         Args:
-            payload: Message shortcut payload from Slack
+            message: Slack message object (from workflow or event)
+            channel_id: Channel ID where message was posted
+            user_id: Optional user ID (for ephemeral messages)
         
         Returns:
             Response dictionary with success status and message
         """
         try:
-            # Extract message and channel information
-            message = payload.get("message", {})
-            channel_id = payload.get("channel", {}).get("id")
-            user_id = payload.get("user", {}).get("id")
-            
             # Validate channel is allowed
             if not is_channel_allowed(channel_id):
-                logger.warning(f"Message shortcut used in unauthorized channel: {channel_id}")
+                logger.warning(f"Workflow message in unauthorized channel: {channel_id}")
                 return {
                     "success": False,
                     "error": "This integration is not enabled for this channel."
@@ -108,13 +105,39 @@ class SlackHandler:
             # Cleanup old mappings (30 days)
             self.thread_store.cleanup_old_mappings(days=30)
             
-            logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack message using form '{form_config['name']}'")
+            logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
             
             return {
                 "success": True,
                 "ticket_id": ticket_result["ticket_id"],
                 "ticket_url": ticket_result["ticket_url"]
             }
+            
+        except Exception as e:
+            logger.error(f"Error handling workflow message: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    def handle_message_shortcut(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle message shortcut callback from Slack (deprecated - kept for backward compatibility).
+        
+        Args:
+            payload: Message shortcut payload from Slack
+        
+        Returns:
+            Response dictionary with success status and message
+        """
+        try:
+            # Extract message and channel information
+            message = payload.get("message", {})
+            channel_id = payload.get("channel", {}).get("id")
+            user_id = payload.get("user", {}).get("id")
+            
+            # Use the common workflow message handler
+            return self.handle_workflow_message(message, channel_id, user_id)
             
         except Exception as e:
             logger.error(f"Error handling message shortcut: {e}", exc_info=True)
