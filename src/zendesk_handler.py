@@ -117,13 +117,6 @@ class ZendeskHandler:
         if "message_link" in message_data:
             description_parts.append(f"Slack Message: {message_data['message_link']}")
         
-        # Add reporter information
-        if "reporter_name" in message_data:
-            description_parts.append(f"Reported by: {message_data['reporter_name']}")
-        
-        if "reporter_email" in message_data:
-            description_parts.append(f"Email: {message_data['reporter_email']}")
-        
         # Add channel information
         if "channel_name" in message_data:
             description_parts.append(f"Channel: #{message_data['channel_name']}")
