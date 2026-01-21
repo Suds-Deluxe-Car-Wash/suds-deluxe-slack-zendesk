@@ -1,224 +1,376 @@
 # Slack-Zendesk Integration
 
-Automated integration that creates Zendesk tickets from Slack messages using Message Shortcuts. Users can click "..." on any message in configured channels and select "Create Zendesk Ticket" to automatically create a support ticket with the message content.
+> **Note**: This integration was built for Suds Deluxe Car Wash. Company-specific IDs and configurations are included but are non-sensitive. All API credentials are externalized via environment variables.
+
+Automated bidirectional integration between Slack and Zendesk that creates support tickets from Slack Workflow Builder forms and syncs updates between both platforms. Tickets are automatically created when users submit workflow forms in configured channels, with thread replies synced as internal notes.
 
 ## Features
 
-- 🎫 **Message Shortcuts**: Create Zendesk tickets directly from Slack messages via the "..." menu
-- 📝 **Workflow Message Parsing**: Automatically extracts structured data from Slack workflow form messages
-- 🎯 **Custom Forms**: Uses pre-configured Zendesk ticket forms with custom fields
-- 🔗 **Thread Responses**: Posts ticket links back to Slack threads for easy tracking
-- 🔒 **Channel Restrictions**: Only works in configured channels for security
-- ✅ **User Feedback**: Sends ephemeral messages to users confirming ticket creation
+- 🤖 **Automatic Ticket Creation**: Workflow form submissions automatically create Zendesk tickets (no manual button clicks needed)
+- 🔄 **Bidirectional Sync**: 
+  - Slack thread replies → Zendesk internal notes
+  - Zendesk comments/notes → Slack thread messages
+- 📝 **Custom Field Mapping**: Automatically maps Slack workflow fields to Zendesk custom fields
+- 👤 **User Mention Resolution**: Converts Slack user IDs (`<@U123>`) to actual names
+- 🎯 **Smart Group Assignment**: Auto-assigns tickets to teams based on issue type
+- 🔗 **Thread Tracking**: Posts ticket links to Slack threads with persistent mapping
+- 🔒 **Channel Security**: Only processes messages from configured channels
+- 🛡️ **Loop Prevention**: Prevents infinite sync loops with message signatures
+- 💾 **PostgreSQL Storage**: Persistent thread-to-ticket mappings with automatic cleanup
 
 ## Architecture
 
 ```
-Slack Message Shortcut → Webhook Server → Slack Handler → Zendesk Handler → Zendesk API
-                                    ↓
-                              Thread Response
+Slack Workflow Form
+        ↓
+   Auto-Detection
+        ↓
+  Message Parser → Custom Field Mapper → Zendesk Ticket Creation
+        ↓                                        ↓
+  Thread Mapping ←─────────────────── Ticket Link Posted
+        ↓
+Thread Replies → Internal Notes (with signature)
+        ↑
+Zendesk Updates ← Webhook Handler (loop prevention)
 ```
+
+## Tech Stack
+
+- **Python 3.8+**: Core application
+- **Flask 3.0.0**: Webhook server
+- **Slack Bolt 1.18.0**: Slack API integration
+- **Zenpy 2.0.50**: Zendesk API client
+- **PostgreSQL**: Thread mapping storage (Supabase)
+- **Gunicorn 21.2.0**: Production WSGI server
+- **Render.com**: Deployment platform
 
 ## Prerequisites
 
 1. **Slack Workspace** with admin permissions to create apps
-2. **Zendesk Account** with API access and a pre-configured ticket form
-3. **Python 3.8+** installed
-4. **Public HTTPS URL** for webhook (ngrok for local testing, or cloud deployment)
+2. **Zendesk Account** with API access and custom ticket forms
+3. **PostgreSQL Database** (Supabase recommended - free tier)
+4. **Python 3.8+** installed
+5. **Public HTTPS URL** for webhooks (Render.com, ngrok, etc.)
 
-## Setup Instructions
+## Quick Start
 
-### 1. Clone and Install Dependencies
+### 1. Clone and Install
 
 ```bash
-# Navigate to project directory
-cd /workspaces/suds-deluxe-slack-zendesk
+git clone https://github.com/LeviJesus/suds-deluxe-slack-zendesk.git
+cd suds-deluxe-slack-zendesk
 
 # Create virtual environment
 python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configure Zendesk
+### 2. Set Up PostgreSQL Database
 
-1. Log into your Zendesk Admin panel
-2. Navigate to **Admin** → **Objects and rules** → **Tickets** → **Forms**
-3. Create or locate your ticket form and note the **Form ID**
-4. Configure custom fields in the form as needed
-5. Navigate to **Admin** → **Apps and integrations** → **APIs** → **Zendesk API**
-6. Enable token access and create a new API token
-7. Save your subdomain, email, and API token
+**Using Supabase (Recommended - Free):**
+1. Go to [supabase.com](https://supabase.com) and create account
+2. Create new project (save the database password)
+3. Go to Settings → Database → Connection string → URI
+4. Copy the connection string (format: `postgresql://postgres.xxxxx:[PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres`)
 
-### 3. Create Slack App
-
-1. Go to [Slack API Apps](https://api.slack.com/apps)
-2. Click **Create New App** → **From scratch**
-3. Name: "Zendesk Custom Ticket Creator"
-4. Select your workspace
-
-#### Configure Message Shortcut:
-1. In the app settings, go to **Interactivity & Shortcuts**
-2. Turn on **Interactivity**
-3. Set **Request URL** to: `https://your-domain.com/slack/events` (update after deployment)
-4. Click **Create New Shortcut** → **On messages**
-5. Name: `Create Custom Zendesk Ticket`
-6. Short Description: `Create a custom Zendesk support ticket from this message`
-7. Callback ID: `create_custom_zendesk_ticket`
-
-#### Configure OAuth & Permissions:
-1. Go to **OAuth & Permissions**
-2. Add these **Bot Token Scopes**:
-   - `chat:write` - Post messages to channels
-   - `channels:history` - View messages in public channels
-   - `users:read` - View user information
-   - `team:read` - View workspace name
-3. Click **Install to Workspace**
-4. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
-
-#### Get Signing Secret:
-1. Go to **Basic Information**
-2. Scroll to **App Credentials**
-3. Copy the **Signing Secret**
-
-### 4. Configure Environment Variables
+### 3. Configure Environment Variables
 
 ```bash
-# Copy example environment file
 cp .env.example .env
-
-# Edit .env with your credentials
-nano .env  # or use your preferred editor
+nano .env  # Edit with your credentials
 ```
 
-Fill in these values in `.env`:
+**Required environment variables:**
 ```env
 # Slack Configuration
-SLACK_BOT_TOKEN=xoxb-your-actual-bot-token
-SLACK_SIGNING_SECRET=your-actual-signing-secret
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_SIGNING_SECRET=your-signing-secret
 
 # Zendesk Configuration
-ZENDESK_SUBDOMAIN=your-company
+ZENDESK_SUBDOMAIN=yourcompany
 ZENDESK_EMAIL=admin@yourcompany.com
-ZENDESK_API_TOKEN=your-zendesk-api-token
-ZENDESK_TICKET_FORM_ID=12345678
+ZENDESK_API_TOKEN=your-api-token
+ZENDESK_AUTOMATION_EMAIL=slack-automation@yourcompany.com
+
+# PostgreSQL Database
+DATABASE_URL=postgresql://postgres.xxxxx:[PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres
 
 # Server Configuration
 PORT=3000
-ENVIRONMENT=development
+ENVIRONMENT=production
 LOG_LEVEL=INFO
 ```
 
-### 5. Configure Channel Mappings
+### 4. Configure Slack App
 
-Edit `config/channel_mappings.json` to add your 4 allowed Slack channels:
+#### Create Slack App:
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
+2. Name: "Zendesk Integration" | Workspace: Select your workspace
 
+#### OAuth & Permissions:
+Add these **Bot Token Scopes**:
+- `chat:write` - Post messages
+- `channels:history` - Read channel messages
+- `users:read` - View user information
+- `team:read` - View workspace details
+
+Install to workspace and copy the **Bot User OAuth Token**
+
+#### Event Subscriptions:
+1. Enable Events
+2. Request URL: `https://your-domain.com/slack/events`
+3. Subscribe to **Bot Events**:
+   - `message.channels` - Listen to channel messages
+
+#### Interactivity & Shortcuts (Optional - for manual fallback):
+1. Enable Interactivity
+2. Request URL: `https://your-domain.com/slack/events`
+3. Create Message Shortcut:
+   - Name: "Create Zendesk Ticket"
+   - Callback ID: `create_custom_zendesk_ticket`
+
+### 5. Configure Zendesk Webhooks
+
+1. Zendesk Admin → Apps and integrations → Webhooks → Create webhook
+2. **Endpoint URL**: `https://your-domain.com/zendesk/webhook`
+3. **Method**: POST
+4. **Format**: JSON
+5. **Triggers**: Create trigger for ticket updates
+   - Conditions: Ticket → Is updated
+   - Actions: Notify webhook → Select your webhook
+
+### 6. Configure Channel and Form Mappings
+
+**Edit `config/channel_mappings.json`:**
 ```json
 {
-  "description": "Maps Slack channel IDs to Zendesk configuration",
   "allowed_channels": [
     {
       "channel_id": "C01234ABCD",
-      "channel_name": "support-requests",
-      "description": "Main support channel"
+      "channel_name": "customer-support",
+      "form_key": "customer_issues_tracker"
     }
   ]
 }
 ```
 
-**To get Channel IDs:**
-1. Right-click on a channel in Slack
-2. Select **View channel details**
-3. Scroll to bottom and copy the **Channel ID**
+Get Channel IDs: Right-click channel → View details → Copy ID (at bottom)
 
-### 6. Run the Application
-
-#### Local Development (with ngrok):
-
-```bash
-# Terminal 1: Start ngrok tunnel
-ngrok http 3000
-
-# Copy the HTTPS URL (e.g., https://abc123.ngrok.io)
-# Update Slack App Request URL to: https://abc123.ngrok.io/slack/events
-
-# Terminal 2: Run the application
-python run.py
+**Edit `config/form_mappings.json`:**
+```json
+{
+  "forms": {
+    "customer_issues_tracker": {
+      "name": "Customer Issues Tracker",
+      "zendesk_form_id": "45508825246107",
+      "field_mappings": {
+        "Location": "45554499814299",
+        "Customer Name": "43945003565979",
+        "Customer Issue Type": "45508647518619"
+      },
+      "subject_template": "Customer Issue: {Customer Issue Type}",
+      "group_mappings": {
+        "field_name": "Customer Issue Type",
+        "rules": {
+          "Cancel": "42987935763867",
+          "default": "42836454078875"
+        }
+      }
+    }
+  }
+}
 ```
 
-#### Production Deployment:
+Get Zendesk Field IDs: Admin → Objects and rules → Tickets → Forms → Edit form → Inspect field IDs
 
-```bash
-# Using gunicorn (production WSGI server)
-gunicorn -w 4 -b 0.0.0.0:3000 src.app:flask_app
-```
+## Deployment
+
+### Deploy to Render.com (Recommended)
+
+1. Create account at [render.com](https://render.com)
+2. New Web Service → Connect your GitHub repo
+3. Configure:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `gunicorn -b 0.0.0.0:$PORT src.app:flask_app`
+4. Add environment variables from `.env`
+5. Deploy!
+
+### Set Up Keepalive (Free Tier)
+
+Render free tier sleeps after 15 minutes. Use cron-job.org:
+1. Go to [cron-job.org](https://cron-job.org)
+2. Create cron job: `https://your-app.onrender.com/health`
+3. Schedule: Every 10 minutes
 
 ## Usage
 
-1. Navigate to one of your configured Slack channels
-2. Find a message (preferably from a Slack workflow form)
-3. Click the **"..."** menu on the message
-4. Select **"Create Zendesk Ticket"**
-5. A Zendesk ticket will be created and the link posted to the thread
-6. You'll receive an ephemeral confirmation message
+### Automatic Ticket Creation
+
+1. Create a Slack Workflow Builder form in a configured channel
+2. Users submit the form
+3. Ticket is automatically created in Zendesk
+4. Ticket link posted to Slack thread
+5. Thread replies sync as internal notes
+6. Zendesk updates appear in Slack thread
+
+### Workflow Form Requirements
+
+For automatic detection, your Slack workflow should:
+- Use Workflow Builder (posts as a bot)
+- Include structured fields (bold field names)
+- Match field names in `form_mappings.json`
 
 ## Project Structure
 
 ```
 suds-deluxe-slack-zendesk/
 ├── src/
-│   ├── app.py                 # Flask webhook server
-│   ├── slack_handler.py       # Slack message parsing and API
-│   ├── zendesk_handler.py     # Zendesk ticket creation
-│   └── config.py              # Configuration management
+│   ├── app.py                      # Flask server & event handlers
+│   ├── slack_handler.py            # Slack API & message parsing
+│   ├── zendesk_handler.py          # Zendesk API & ticket creation
+│   ├── zendesk_webhook_handler.py  # Webhook processing & loop prevention
+│   ├── thread_store.py             # PostgreSQL thread mapping
+│   └── config.py                   # Configuration management
 ├── config/
-│   └── channel_mappings.json  # Channel allowlist
-├── requirements.txt           # Python dependencies
-├── .env.example              # Environment template
-├── run.py                    # Application entry point
-└── README.md                 # This file
+│   ├── channel_mappings.json       # Allowed channels
+│   └── form_mappings.json          # Field mappings & templates
+├── requirements.txt                # Python dependencies
+├── run.py                          # Application entry point
+└── README.md                       # Documentation
 ```
 
-## Customization
+## Key Features Explained
 
-### Parsing Workflow Messages
+### Automatic Workflow Detection
 
-The `slack_handler.py` includes a flexible parser that handles:
-- **Block-based messages** (from Slack workflow builder)
-- **Plain text messages** with key:value pairs
+The system identifies Slack Workflow Builder messages by:
+- Presence of `bot_profile` field
+- Structured `rich_text` blocks
+- Bot message subtype
 
-To customize field mapping, edit the `_extract_field_from_text()` method in `slack_handler.py`.
+When detected, tickets are created automatically without user intervention.
 
-### Custom Fields
+### User Mention Resolution
 
-To map Slack data to Zendesk custom fields:
+Slack user mentions (`<@U0A8W3T1136>`) are automatically converted to actual names in:
+- Zendesk ticket descriptions
+- Zendesk custom fields
+- Thread reply comments
 
-1. Get custom field IDs from Zendesk Admin
-2. In `slack_handler.py`, modify the `handle_message_shortcut()` method to pass a `custom_fields` dictionary:
+### Loop Prevention
 
-```python
-custom_fields = {
-    "360001234567": parsed_data.get("priority"),  # Example field ID
-    "360007654321": parsed_data.get("category")
-}
+Thread replies include a `[Posted from Slack]` signature. When Zendesk webhooks send updates back to Slack, comments with this signature are ignored to prevent infinite loops.
 
-ticket_result = self.zendesk_handler.create_ticket_from_slack_message(
-    parsed_data,
-    custom_fields=custom_fields
-)
-```
+### Automatic Cleanup
+
+Thread mappings older than 30 days are automatically deleted to prevent database bloat. This runs on every ticket creation.
 
 ## Troubleshooting
 
-### "Missing required environment variables"
-- Ensure you've copied `.env.example` to `.env`
-- Verify all values are filled in (no placeholder text)
+### Tickets Not Creating Automatically
 
-### "This integration is not enabled for this channel"
-- Check that the channel ID is in `config/channel_mappings.json`
-- Verify the channel ID is correct (right-click channel → View details)
+- Check Render logs for workflow detection messages
+- Verify workflow form uses Workflow Builder (not manual bot messages)
+- Confirm channel ID in `channel_mappings.json`
+- Check field names match exactly in `form_mappings.json`
+
+### Thread Replies Not Syncing
+
+- Verify `message.channels` event subscription in Slack app
+- Check thread mapping exists in database
+- Review logs for event processing messages
+
+### Zendesk Updates Not Appearing in Slack
+
+- Confirm webhook is configured in Zendesk
+- Verify webhook URL is correct
+- Check Zendesk webhook logs for delivery status
+- Review Render logs for webhook receipt
+
+### Database Connection Errors
+
+- Verify `DATABASE_URL` is set in Render environment variables
+- Test database connection string locally
+- Check Supabase project is active
+
+## Development
+
+### Local Development with ngrok
+
+```bash
+# Terminal 1: Start ngrok
+ngrok http 3000
+
+# Terminal 2: Run app
+python run.py
+
+# Update Slack App Request URL to: https://xxxxx.ngrok.io/slack/events
+```
+
+### View Logs
+
+```bash
+# Local
+python run.py
+
+# Render.com
+# Go to your service → Logs tab (live tail)
+```
+
+## Security
+
+- ✅ All credentials in environment variables (never committed)
+- ✅ `.env` file in `.gitignore`
+- ✅ Slack request signature validation
+- ✅ Channel allowlist prevents unauthorized access
+- ✅ HTTPS-only webhooks
+- ✅ PostgreSQL connections encrypted
+
+## Performance
+
+- **Cold Start**: ~5-10 seconds (Render free tier)
+- **Ticket Creation**: ~2-3 seconds
+- **Thread Reply Sync**: <1 second
+- **Database Queries**: <100ms
+
+## Limitations
+
+- Free tier sleeps after 15 minutes (mitigated with keepalive)
+- PostgreSQL connection pool: 1-10 connections
+- Slack rate limits: 1 request/second per method
+- Zendesk rate limits: 700 requests/minute
+
+## Future Enhancements
+
+- [ ] Multi-workspace support
+- [ ] Attachment sync (Slack ↔ Zendesk)
+- [ ] SLA tracking integration
+- [ ] Analytics dashboard
+- [ ] Email notification triggers
+
+## Contributing
+
+This is a proprietary project for Suds Deluxe Car Wash, but feel free to fork for your own use cases.
+
+## License
+
+Proprietary - Built by Levi Jesus for Suds Deluxe Car Wash
+
+## Author
+
+**Levi Jesus**  
+GitHub: [@LeviJesus](https://github.com/LeviJesus)  
+Project built January 2026
+
+## Acknowledgments
+
+- Slack Bolt SDK for Python
+- Zenpy Zendesk Python client
+- Render.com for deployment platform
+- Supabase for PostgreSQL hosting
 
 ### Slack doesn't show the shortcut
 - Verify the Slack app is installed to the workspace
