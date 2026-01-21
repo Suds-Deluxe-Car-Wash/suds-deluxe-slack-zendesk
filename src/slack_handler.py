@@ -534,7 +534,7 @@ class SlackHandler:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f":ticket: *Zendesk Ticket Created*\n<@{user_id}> created a support ticket from this message."
+                        "text": ":ticket: *Zendesk Ticket Created*"
                     }
                 },
                 {
