@@ -1,5 +1,6 @@
 """Zendesk ticket creation and management."""
 import logging
+import re
 from typing import Dict, Any, Optional
 from zenpy import Zenpy
 from zenpy.lib.api_objects import Ticket, CustomField, Comment, User
@@ -19,6 +20,9 @@ class ZendeskHandler:
                 email=Config.ZENDESK_EMAIL,
                 token=Config.ZENDESK_API_TOKEN
             )
+            # Import WebClient for user name resolution
+            from slack_sdk import WebClient
+            self.slack_client = WebClient(token=Config.SLACK_BOT_TOKEN)
             logger.info("Zendesk client initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Zendesk client: {e}")
@@ -128,9 +132,38 @@ class ZendeskHandler:
         if "additional_fields" in message_data:
             description_parts.append("\n**Additional Information:**")
             for key, value in message_data["additional_fields"].items():
-                description_parts.append(f"- {key}: {value}")
+                # Resolve Slack user mentions to actual names
+                resolved_value = self._resolve_user_mentions(str(value))
+                description_parts.append(f"- {key}: {resolved_value}")
         
         return "\n".join(description_parts)
+    
+    def _resolve_user_mentions(self, text: str) -> str:
+        """
+        Replace Slack user mention codes with actual usernames.
+        
+        Args:
+            text: Text potentially containing Slack user mentions like <@U12345>
+        
+        Returns:
+            Text with user mentions resolved to actual names
+        """
+        if '<@' not in text:
+            return text
+        
+        # Find all user mentions
+        user_ids = re.findall(r'<@([A-Z0-9]+)>', text)
+        
+        for user_id in user_ids:
+            try:
+                user_info = self.slack_client.users_info(user=user_id)
+                username = user_info["user"]["profile"].get("display_name") or user_info["user"]["real_name"]
+                text = text.replace(f'<@{user_id}>', username)
+            except Exception as e:
+                logger.warning(f"Could not resolve user {user_id}: {e}")
+                # Leave the mention as-is if we can't resolve it
+        
+        return text
     
     def add_comment_to_ticket(self, ticket_id: int, comment_text: str) -> bool:
         """
