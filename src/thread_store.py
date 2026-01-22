@@ -24,11 +24,20 @@ class ThreadMappingStore:
             raise ValueError("DATABASE_URL environment variable is required")
         
         # Create connection pool (min 1, max 10 connections)
+        # Configured for Supabase Connection Pooler (Transaction mode)
         try:
             self.connection_pool = ConnectionPool(
                 self.database_url,
                 min_size=1,
-                max_size=10
+                max_size=10,
+                kwargs={
+                    "autocommit": True,  # Required for Supabase transaction pooler
+                    "prepare_threshold": None,  # Disable prepared statements
+                    "options": "-c statement_timeout=30000"  # 30 second timeout
+                },
+                check=ConnectionPool.check_connection,  # Health check for connections
+                max_idle=300,  # Close idle connections after 5 minutes
+                max_lifetime=3600  # Recycle connections after 1 hour
             )
             logger.info("PostgreSQL connection pool created successfully")
         except Exception as e:
@@ -77,7 +86,6 @@ class ThreadMappingStore:
                         ON thread_mappings(created_at)
                     """)
                     
-                    conn.commit()
                     logger.info("PostgreSQL tables initialized successfully")
                     
         except Exception as e:
@@ -111,7 +119,6 @@ class ThreadMappingStore:
                             created_at = EXCLUDED.created_at
                     """, (thread_ts, ticket_id, channel_id, datetime.now()))
                     
-                    conn.commit()
                     logger.info(f"Stored mapping: thread_ts={thread_ts} → ticket_id={ticket_id}")
             return True
             
@@ -219,7 +226,6 @@ class ThreadMappingStore:
                         ON CONFLICT (event_id) DO NOTHING
                     """, (event_id, datetime.now()))
                     
-                    conn.commit()
             return True
             
         except Exception as e:
@@ -256,8 +262,6 @@ class ThreadMappingStore:
                     """, (cutoff_date,))
                     
                     deleted_events = cursor.rowcount
-                    
-                    conn.commit()
                     
                     logger.info(f"Cleanup: Deleted {deleted_mappings} thread mappings and {deleted_events} processed events older than {days} days")
                     return deleted_mappings
