@@ -34,6 +34,20 @@ class SlackHandler:
             Response dictionary with success status and message
         """
         try:
+            # Check for duplicate ticket creation (prevents double-clicks on manual button)
+            message_ts = message.get("ts")
+            if message_ts and self.thread_store.is_event_processed(message_ts):
+                logger.info(f"Ticket already created for message {message_ts}, skipping duplicate")
+                # Return the existing ticket info if available
+                existing_ticket_id = self.thread_store.get_ticket_id(message_ts)
+                if existing_ticket_id:
+                    return {
+                        "success": True,
+                        "ticket_id": existing_ticket_id,
+                        "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
+                        "duplicate_prevented": True
+                    }
+            
             # Validate channel is allowed
             if not is_channel_allowed(channel_id):
                 logger.warning(f"Workflow message in unauthorized channel: {channel_id}")
@@ -101,6 +115,10 @@ class SlackHandler:
                 ticket_id=ticket_result["ticket_id"],
                 channel_id=channel_id
             )
+            
+            # Mark message as processed to prevent duplicate button clicks
+            if message_ts:
+                self.thread_store.mark_event_processed(message_ts)
             
             # Cleanup old mappings (30 days)
             self.thread_store.cleanup_old_mappings(days=30)
