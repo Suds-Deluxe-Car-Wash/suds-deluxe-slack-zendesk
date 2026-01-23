@@ -6,6 +6,30 @@
       "channel_name": "test-zendesk-slack-integration",
       "description": "Testing Zendesk-Slack custom integration",
       "form_key": "customer_issues_tracker"
+    }, 
+    {
+      "channel_id": "C0514MM04EQ",
+      "channel_name": "customer-issues-from-support-htx",
+      "description": "This channel will be used for customer issues dealing with membership and billing for all car wash locations.",
+      "form_key": "customer_issues_tracker"
+    }, 
+    {
+      "channel_id": "C052WUUQE0Z",
+      "channel_name": "customer-issues-from-support-ctx",
+      "description": "Customer requests for the Central Texas washes",
+      "form_key": "customer_issues_tracker"
+    }, 
+    {
+      "channel_id": "C05Q8C869NV",
+      "channel_name": "customer-issues-from-htx-wash",
+      "description": "",
+      "form_key": "customer_issues_tracker"
+    }, 
+    {
+      "channel_id": "C05PY6ARKGC",
+      "channel_name": "customer-issues-from-ctx-wash",
+      "description": "",
+      "form_key": "customer_issues_tracker"
     }
   ],
   "notes": "Each channel is assigned a form_key that references a form in form_mappings.json. Replace channel_id values with your actual Slack channel IDs. Find them by right-clicking a channel -> View channel details -> Copy ID (at bottom)"
