@@ -128,10 +128,11 @@ def handle_message_events(event, client, logger):
             logger.debug(f"Skipping message from non-allowed channel {channel_id}")
             return
         
-        # Get event_id for deduplication
-        event_id = event.get("event_id") or event.get("client_msg_id")
-        if event_id and slack_handler.thread_store.is_event_processed(event_id):
-            logger.debug(f"Event {event_id} already processed, skipping")
+        # Use message timestamp (ts) for deduplication - this is unique per message
+        # and doesn't change across Slack webhook retries (unlike event_id)
+        message_ts = event.get("ts")
+        if message_ts and slack_handler.thread_store.is_event_processed(message_ts):
+            logger.debug(f"Message {message_ts} already processed, skipping duplicate")
             return
         
         # Determine if this is a workflow message or a thread reply
@@ -147,9 +148,9 @@ def handle_message_events(event, client, logger):
             # This is a user reply in a thread - try to add to Zendesk
             success = slack_handler.add_thread_reply_to_ticket(event)
             
-            # Mark event as processed to prevent duplicates
-            if event_id:
-                slack_handler.thread_store.mark_event_processed(event_id)
+            # Mark as processed after successful thread reply
+            if success and message_ts:
+                slack_handler.thread_store.mark_event_processed(message_ts)
             
             if success:
                 logger.info(f"Thread reply added to Zendesk from thread {event.get('thread_ts')}")
@@ -160,16 +161,17 @@ def handle_message_events(event, client, logger):
             if _is_workflow_message(event):
                 logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
                 
+                # Mark as processed IMMEDIATELY to prevent duplicates from Slack retries
+                # (during cold starts, Slack retries webhook 2-3 times for the same message)
+                if message_ts:
+                    slack_handler.thread_store.mark_event_processed(message_ts)
+                
                 # Automatically create ticket from workflow message
                 result = slack_handler.handle_workflow_message(
                     message=event,
                     channel_id=channel_id,
                     user_id=event.get("user")
                 )
-                
-                # Mark event as processed to prevent duplicates
-                if event_id:
-                    slack_handler.thread_store.mark_event_processed(event_id)
                 
                 if result.get("success"):
                     logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
