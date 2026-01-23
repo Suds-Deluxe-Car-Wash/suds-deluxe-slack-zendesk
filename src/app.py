@@ -161,11 +161,6 @@ def handle_message_events(event, client, logger):
             if _is_workflow_message(event):
                 logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
                 
-                # Mark as processed IMMEDIATELY to prevent duplicates from Slack retries
-                # (during cold starts, Slack retries webhook 2-3 times for the same message)
-                if message_ts:
-                    slack_handler.thread_store.mark_event_processed(message_ts)
-                
                 # Automatically create ticket from workflow message
                 result = slack_handler.handle_workflow_message(
                     message=event,
@@ -174,9 +169,14 @@ def handle_message_events(event, client, logger):
                 )
                 
                 if result.get("success"):
+                    # Mark as processed ONLY on success to prevent duplicates
+                    # but allow retries (automatic + manual) if ticket creation fails
+                    if message_ts:
+                        slack_handler.thread_store.mark_event_processed(message_ts)
                     logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
-                    logger.error(f"Failed to auto-create ticket: {result.get('error')}")
+                    # Don't mark as processed - allows Slack retries and manual button attempts
+                    logger.error(f"Failed to auto-create ticket: {result.get('error')} - not marked as processed, retries allowed")
         
     except Exception as e:
         logger.error(f"Error processing message event: {e}", exc_info=True)
