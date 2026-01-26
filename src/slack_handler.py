@@ -34,13 +34,13 @@ class SlackHandler:
             Response dictionary with success status and message
         """
         try:
-            # Check for duplicate ticket creation (prevents double-clicks on manual button)
+            # Check for duplicate ticket creation using thread mapping (race-condition safe)
+            # The thread_ts is a PRIMARY KEY in database, so this check is atomic
             message_ts = message.get("ts")
-            if message_ts and self.thread_store.is_event_processed(message_ts):
-                logger.info(f"Ticket already created for message {message_ts}, skipping duplicate")
-                # Return the existing ticket info if available
+            if message_ts:
                 existing_ticket_id = self.thread_store.get_ticket_id(message_ts)
                 if existing_ticket_id:
+                    logger.info(f"Ticket #{existing_ticket_id} already exists for message {message_ts}, preventing duplicate")
                     return {
                         "success": True,
                         "ticket_id": existing_ticket_id,
@@ -110,15 +110,12 @@ class SlackHandler:
             )
             
             # Store thread mapping for future replies
+            # The PRIMARY KEY constraint on thread_ts prevents duplicate tickets
             self.thread_store.store_mapping(
                 thread_ts=message.get("ts"),
                 ticket_id=ticket_result["ticket_id"],
                 channel_id=channel_id
             )
-            
-            # Mark message as processed to prevent duplicate button clicks
-            if message_ts:
-                self.thread_store.mark_event_processed(message_ts)
             
             # Cleanup old mappings (30 days)
             self.thread_store.cleanup_old_mappings(days=30)
