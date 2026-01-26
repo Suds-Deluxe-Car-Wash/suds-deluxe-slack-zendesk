@@ -169,14 +169,10 @@ def handle_message_events(event, client, logger):
                 )
                 
                 if result.get("success"):
-                    # Mark as processed ONLY on success to prevent duplicates
-                    # but allow retries (automatic + manual) if ticket creation fails
-                    if message_ts:
-                        slack_handler.thread_store.mark_event_processed(message_ts)
                     logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
-                    # Don't mark as processed - allows Slack retries and manual button attempts
-                    logger.error(f"Failed to auto-create ticket: {result.get('error')} - not marked as processed, retries allowed")
+                    # Ticket creation failed - allow retries
+                    logger.error(f"Failed to auto-create ticket: {result.get('error')} - will allow retry")
         
     except Exception as e:
         logger.error(f"Error processing message event: {e}", exc_info=True)
