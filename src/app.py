@@ -1,6 +1,8 @@
 """Flask webhook server for Slack-Zendesk integration."""
 import logging
 import sys
+import threading
+import time
 from flask import Flask, request, jsonify
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -283,11 +285,38 @@ def home():
     }), 200
 
 
+def schedule_monthly_cleanup():
+    """Start background task to cleanup old database mappings once per month."""
+    def cleanup_worker():
+        """Background worker that runs cleanup every 30 days."""
+        from src.thread_store import ThreadMappingStore
+        
+        store = ThreadMappingStore()
+        
+        while True:
+            try:
+                # Sleep for 30 days (in seconds)
+                time.sleep(30 * 24 * 60 * 60)
+                logger.info("Running scheduled monthly cleanup of old mappings...")
+                deleted = store.cleanup_old_mappings(days=30)
+                logger.info(f"Monthly cleanup completed: removed {deleted} old mappings")
+            except Exception as e:
+                logger.error(f"Error in monthly cleanup task: {e}", exc_info=True)
+    
+    # Start background thread as daemon (won't block shutdown)
+    thread = threading.Thread(target=cleanup_worker, daemon=True)
+    thread.start()
+    logger.info("Scheduled monthly cleanup task started (runs every 30 days)")
+
+
 def main():
     """Start the Flask application."""
     logger.info("Starting Slack-Zendesk Integration Server")
     logger.info(f"Environment: {Config.ENVIRONMENT}")
     logger.info(f"Port: {Config.PORT}")
+    
+    # Start background cleanup task
+    schedule_monthly_cleanup()
     
     # Run Flask app
     flask_app.run(

@@ -117,9 +117,6 @@ class SlackHandler:
                 channel_id=channel_id
             )
             
-            # Cleanup old mappings (30 days)
-            self.thread_store.cleanup_old_mappings(days=30)
-            
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
             
             return {

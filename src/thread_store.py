@@ -23,13 +23,13 @@ class ThreadMappingStore:
         if not self.database_url:
             raise ValueError("DATABASE_URL environment variable is required")
         
-        # Create connection pool (min 1, max 10 connections)
+        # Create connection pool (min 1, max 30 connections)
         # Configured for Supabase Connection Pooler (Transaction mode)
         try:
             self.connection_pool = ConnectionPool(
                 self.database_url,
                 min_size=1,
-                max_size=10,
+                max_size=30,
                 kwargs={
                     "autocommit": True,  # Required for Supabase transaction pooler
                     "prepare_threshold": None,  # Disable prepared statements
