@@ -171,11 +171,14 @@ def handle_message_events(event, client, logger):
                 if result.get("success"):
                     logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
-                    # Ticket creation failed - allow retries
-                    logger.error(f"Failed to auto-create ticket: {result.get('error')} - will allow retry")
+                    # Ticket creation failed - raise exception to trigger Slack retry
+                    error_msg = result.get('error', 'Unknown error')
+                    logger.error(f"Failed to auto-create ticket: {error_msg} - triggering Slack retry")
+                    raise Exception(f"Ticket creation failed: {error_msg}")
         
     except Exception as e:
         logger.error(f"Error processing message event: {e}", exc_info=True)
+        raise  # Re-raise to trigger Slack webhook retry
 
 
 def _is_workflow_message(event: dict) -> bool:
