@@ -163,6 +163,11 @@ def handle_message_events(event, client, logger):
             if _is_workflow_message(event):
                 logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
                 
+                # Mark as processed IMMEDIATELY to prevent race condition duplicates
+                # This prevents duplicate ticket creation when Slack sends the same event multiple times
+                if message_ts:
+                    slack_handler.thread_store.mark_event_processed(message_ts)
+                
                 # Automatically create ticket from workflow message
                 result = slack_handler.handle_workflow_message(
                     message=event,
