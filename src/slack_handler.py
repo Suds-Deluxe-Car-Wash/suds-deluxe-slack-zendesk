@@ -109,13 +109,25 @@ class SlackHandler:
                 user_id=user_id
             )
             
-            # Store thread mapping for future replies
+            # Store thread mapping for future replies (atomic duplicate prevention)
             # The PRIMARY KEY constraint on thread_ts prevents duplicate tickets
-            self.thread_store.store_mapping(
+            stored = self.thread_store.store_mapping(
                 thread_ts=message.get("ts"),
                 ticket_id=ticket_result["ticket_id"],
                 channel_id=channel_id
             )
+            
+            if not stored:
+                # Another request already created a ticket for this thread
+                # Get the actual ticket that was stored first
+                existing_ticket_id = self.thread_store.get_ticket_id(message.get("ts"))
+                logger.warning(f"Duplicate ticket {ticket_result['ticket_id']} prevented - using existing #{existing_ticket_id}")
+                return {
+                    "success": True,
+                    "ticket_id": existing_ticket_id,
+                    "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
+                    "duplicate_prevented": True
+                }
             
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
             

@@ -94,7 +94,10 @@ class ThreadMappingStore:
     
     def store_mapping(self, thread_ts: str, ticket_id: int, channel_id: str) -> bool:
         """
-        Store a mapping between Slack thread and Zendesk ticket.
+        Store a mapping between Slack thread and Zendesk ticket ATOMICALLY.
+        
+        This will ONLY succeed if this is the first ticket for this thread.
+        On conflict, it returns False (another request already claimed it).
         
         Args:
             thread_ts: Slack thread timestamp
@@ -102,25 +105,31 @@ class ThreadMappingStore:
             channel_id: Slack channel ID
             
         Returns:
-            True if stored successfully, False otherwise
+            True if this is the first ticket for this thread (success),
+            False if another ticket already exists for this thread (duplicate)
         """
         try:
             with self.connection_pool.connection() as conn:
                 with conn.cursor() as cursor:
-                    # PostgreSQL uses ON CONFLICT for upsert
+                    # Try to insert - if thread_ts exists, DO NOTHING and return nothing
                     cursor.execute("""
                         INSERT INTO thread_mappings 
                         (thread_ts, ticket_id, channel_id, created_at)
                         VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (thread_ts) 
-                        DO UPDATE SET 
-                            ticket_id = EXCLUDED.ticket_id,
-                            channel_id = EXCLUDED.channel_id,
-                            created_at = EXCLUDED.created_at
+                        ON CONFLICT (thread_ts) DO NOTHING
+                        RETURNING thread_ts
                     """, (thread_ts, ticket_id, channel_id, datetime.now()))
                     
-                    logger.info(f"Stored mapping: thread_ts={thread_ts} → ticket_id={ticket_id}")
-            return True
+                    # If we got a row back, we successfully claimed this thread
+                    # If no row, another request already created a ticket
+                    result = cursor.fetchone()
+                    
+                    if result is not None:
+                        logger.info(f"Stored mapping: thread_ts={thread_ts} → ticket_id={ticket_id}")
+                        return True
+                    else:
+                        logger.warning(f"Thread {thread_ts} already has a ticket, duplicate prevented at storage")
+                        return False
             
         except Exception as e:
             logger.error(f"Failed to store mapping: {e}")

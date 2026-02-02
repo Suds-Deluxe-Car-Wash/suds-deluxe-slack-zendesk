@@ -163,10 +163,8 @@ def handle_message_events(event, client, logger):
             if _is_workflow_message(event):
                 logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
                 
-                # Mark as processed IMMEDIATELY to prevent race condition duplicates
-                # This prevents duplicate ticket creation when Slack sends the same event multiple times
-                if message_ts:
-                    slack_handler.thread_store.mark_event_processed(message_ts)
+                # Deduplication happens atomically in handle_workflow_message via store_mapping
+                # which uses PRIMARY KEY constraint on thread_ts for race-condition-safe prevention
                 
                 # Automatically create ticket from workflow message
                 result = slack_handler.handle_workflow_message(
@@ -176,7 +174,10 @@ def handle_message_events(event, client, logger):
                 )
                 
                 if result.get("success"):
-                    logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
+                    if result.get("duplicate_prevented"):
+                        logger.info(f"Duplicate prevented: ticket #{result['ticket_id']} already exists")
+                    else:
+                        logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
                     # Ticket creation failed - raise exception to trigger Slack retry
                     error_msg = result.get('error', 'Unknown error')
