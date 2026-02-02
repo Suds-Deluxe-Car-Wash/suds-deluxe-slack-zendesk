@@ -135,6 +135,80 @@ class ThreadMappingStore:
             logger.error(f"Failed to store mapping: {e}")
             return False
     
+    def claim_thread(self, thread_ts: str, channel_id: str) -> bool:
+        """
+        Atomically claim a thread for ticket creation.
+        
+        This MUST be called BEFORE creating the Zendesk ticket to prevent race conditions.
+        It inserts a placeholder (-1) to reserve the thread_ts.
+        
+        Args:
+            thread_ts: Slack thread timestamp to claim
+            channel_id: Slack channel ID
+            
+        Returns:
+            True if this request successfully claimed the thread (first),
+            False if another request already claimed it (duplicate)
+        """
+        try:
+            with self.connection_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    # Insert placeholder with ticket_id=-1 to claim the thread
+                    cursor.execute("""
+                        INSERT INTO thread_mappings 
+                        (thread_ts, ticket_id, channel_id, created_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (thread_ts) DO NOTHING
+                        RETURNING thread_ts
+                    """, (thread_ts, -1, channel_id, datetime.now()))
+                    
+                    result = cursor.fetchone()
+                    
+                    if result is not None:
+                        logger.info(f"Claimed thread {thread_ts} for ticket creation")
+                        return True
+                    else:
+                        logger.info(f"Thread {thread_ts} already claimed by another request")
+                        return False
+            
+        except Exception as e:
+            logger.error(f"Failed to claim thread {thread_ts}: {e}")
+            return False
+    
+    def update_ticket_mapping(self, thread_ts: str, ticket_id: int) -> bool:
+        """
+        Update a claimed thread with the actual ticket ID.
+        
+        Called after successfully creating a Zendesk ticket to replace
+        the placeholder (-1) with the real ticket ID.
+        
+        Args:
+            thread_ts: Slack thread timestamp
+            ticket_id: Zendesk ticket ID
+            
+        Returns:
+            True if updated successfully
+        """
+        try:
+            with self.connection_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE thread_mappings 
+                        SET ticket_id = %s
+                        WHERE thread_ts = %s AND ticket_id = -1
+                    """, (ticket_id, thread_ts))
+                    
+                    if cursor.rowcount > 0:
+                        logger.info(f"Updated mapping: thread_ts={thread_ts} → ticket_id={ticket_id}")
+                        return True
+                    else:
+                        logger.warning(f"Failed to update mapping for {thread_ts} - no placeholder found")
+                        return False
+            
+        except Exception as e:
+            logger.error(f"Failed to update ticket mapping: {e}")
+            return False
+    
     def get_ticket_id(self, thread_ts: str) -> Optional[int]:
         """
         Retrieve Zendesk ticket ID for a given Slack thread.

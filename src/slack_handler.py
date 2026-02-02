@@ -34,19 +34,32 @@ class SlackHandler:
             Response dictionary with success status and message
         """
         try:
-            # Check for duplicate ticket creation using thread mapping (race-condition safe)
-            # The thread_ts is a PRIMARY KEY in database, so this check is atomic
             message_ts = message.get("ts")
+            
+            # ATOMIC CLAIM: Reserve this thread BEFORE doing anything else
+            # This prevents race conditions where multiple requests create tickets simultaneously
             if message_ts:
-                existing_ticket_id = self.thread_store.get_ticket_id(message_ts)
-                if existing_ticket_id:
-                    logger.info(f"Ticket #{existing_ticket_id} already exists for message {message_ts}, preventing duplicate")
-                    return {
-                        "success": True,
-                        "ticket_id": existing_ticket_id,
-                        "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
-                        "duplicate_prevented": True
-                    }
+                claimed = self.thread_store.claim_thread(message_ts, channel_id)
+                if not claimed:
+                    # Another request already claimed this thread
+                    # Get the existing ticket (may still be placeholder -1 if other request is in progress)
+                    existing_ticket_id = self.thread_store.get_ticket_id(message_ts)
+                    if existing_ticket_id and existing_ticket_id != -1:
+                        logger.info(f"Ticket #{existing_ticket_id} already exists for message {message_ts}, preventing duplicate")
+                        return {
+                            "success": True,
+                            "ticket_id": existing_ticket_id,
+                            "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
+                            "duplicate_prevented": True
+                        }
+                    else:
+                        # Placeholder exists, another request is creating the ticket right now
+                        logger.info(f"Another request is creating ticket for message {message_ts}, preventing duplicate")
+                        return {
+                            "success": True,
+                            "duplicate_prevented": True,
+                            "message": "Ticket creation in progress by another request"
+                        }
             
             # Validate channel is allowed
             if not is_channel_allowed(channel_id):
@@ -109,25 +122,15 @@ class SlackHandler:
                 user_id=user_id
             )
             
-            # Store thread mapping for future replies (atomic duplicate prevention)
-            # The PRIMARY KEY constraint on thread_ts prevents duplicate tickets
-            stored = self.thread_store.store_mapping(
-                thread_ts=message.get("ts"),
-                ticket_id=ticket_result["ticket_id"],
-                channel_id=channel_id
-            )
-            
-            if not stored:
-                # Another request already created a ticket for this thread
-                # Get the actual ticket that was stored first
-                existing_ticket_id = self.thread_store.get_ticket_id(message.get("ts"))
-                logger.warning(f"Duplicate ticket {ticket_result['ticket_id']} prevented - using existing #{existing_ticket_id}")
-                return {
-                    "success": True,
-                    "ticket_id": existing_ticket_id,
-                    "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
-                    "duplicate_prevented": True
-                }
+            # Update the claimed thread with the actual ticket ID
+            if message_ts:
+                updated = self.thread_store.update_ticket_mapping(
+                    thread_ts=message_ts,
+                    ticket_id=ticket_result["ticket_id"]
+                )
+                
+                if not updated:
+                    logger.error(f"Failed to update ticket mapping for {message_ts} - this should not happen!")
             
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
             
