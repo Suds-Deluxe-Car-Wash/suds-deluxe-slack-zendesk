@@ -62,12 +62,29 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         result = slack_handler.handle_message_shortcut(shortcut)
         
         if result.get("success"):
-            # Send ephemeral success message to user
-            client.chat_postEphemeral(
-                channel=shortcut["channel"]["id"],
-                user=shortcut["user"]["id"],
-                text=f"✅ Zendesk ticket #{result['ticket_id']} created successfully! Check the thread for details."
-            )
+            # Check if this was a duplicate prevention or actual creation
+            if result.get("duplicate_prevented"):
+                if "ticket_id" in result:
+                    # Duplicate found with existing ticket
+                    client.chat_postEphemeral(
+                        channel=shortcut["channel"]["id"],
+                        user=shortcut["user"]["id"],
+                        text=f"ℹ️ Ticket #{result['ticket_id']} already exists for this message. Check the thread for details."
+                    )
+                else:
+                    # Placeholder exists (creation in progress or stale) - tell user to wait/retry
+                    client.chat_postEphemeral(
+                        channel=shortcut["channel"]["id"],
+                        user=shortcut["user"]["id"],
+                        text=f"⏳ A ticket is being created for this message. Please wait a moment and check the thread, or try again in a few seconds."
+                    )
+            else:
+                # New ticket created successfully
+                client.chat_postEphemeral(
+                    channel=shortcut["channel"]["id"],
+                    user=shortcut["user"]["id"],
+                    text=f"✅ Zendesk ticket #{result['ticket_id']} created successfully! Check the thread for details."
+                )
         else:
             # Send ephemeral error message to user
             error_message = result.get("error", "Unknown error occurred")

@@ -141,6 +141,7 @@ class ThreadMappingStore:
         
         This MUST be called BEFORE creating the Zendesk ticket to prevent race conditions.
         It inserts a placeholder (-1) to reserve the thread_ts.
+        Also cleans up stale placeholders from failed previous attempts.
         
         Args:
             thread_ts: Slack thread timestamp to claim
@@ -153,7 +154,19 @@ class ThreadMappingStore:
         try:
             with self.connection_pool.connection() as conn:
                 with conn.cursor() as cursor:
-                    # Insert placeholder with ticket_id=-1 to claim the thread
+                    # First, clean up stale placeholders (older than 5 minutes)
+                    stale_threshold = datetime.now() - timedelta(minutes=5)
+                    cursor.execute("""
+                        DELETE FROM thread_mappings 
+                        WHERE thread_ts = %s 
+                        AND ticket_id = -1 
+                        AND created_at < %s
+                    """, (thread_ts, stale_threshold))
+                    
+                    if cursor.rowcount > 0:
+                        logger.warning(f"Cleaned up stale placeholder for thread {thread_ts}")
+                    
+                    # Now try to insert placeholder with ticket_id=-1 to claim the thread
                     cursor.execute("""
                         INSERT INTO thread_mappings 
                         (thread_ts, ticket_id, channel_id, created_at)
