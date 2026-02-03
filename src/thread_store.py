@@ -154,8 +154,9 @@ class ThreadMappingStore:
         try:
             with self.connection_pool.connection() as conn:
                 with conn.cursor() as cursor:
-                    # First, clean up stale placeholders (older than 5 minutes)
-                    stale_threshold = datetime.now() - timedelta(minutes=5)
+                    # First, clean up stale placeholders (older than 30 seconds)
+                    # This allows quick retry after connection failures during cold starts
+                    stale_threshold = datetime.now() - timedelta(seconds=30)
                     cursor.execute("""
                         DELETE FROM thread_mappings 
                         WHERE thread_ts = %s 
