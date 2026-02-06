@@ -192,7 +192,10 @@ def handle_message_events(event, client, logger):
                 
                 if result.get("success"):
                     if result.get("duplicate_prevented"):
-                        logger.info(f"Duplicate prevented: ticket #{result['ticket_id']} already exists")
+                        if "ticket_id" in result:
+                            logger.info(f"Duplicate prevented: ticket #{result['ticket_id']} already exists")
+                        else:
+                            logger.info(f"Duplicate prevented: ticket creation in progress or stale placeholder cleaned")
                     else:
                         logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
