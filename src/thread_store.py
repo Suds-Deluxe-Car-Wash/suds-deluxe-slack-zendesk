@@ -1,6 +1,7 @@
 """Thread mapping storage for Slack thread to Zendesk ticket association."""
 import os
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 import psycopg
@@ -11,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 class ThreadMappingStore:
     """Manages persistent storage of Slack thread_ts to Zendesk ticket_id mappings."""
+    _shared_pool = None
+    _pool_lock = threading.Lock()
+    _db_initialized = False
     
     def __init__(self):
         """
@@ -23,29 +27,35 @@ class ThreadMappingStore:
         if not self.database_url:
             raise ValueError("DATABASE_URL environment variable is required")
         
-        # Create connection pool (min 1, max 50 connections)
-        # Configured for Supabase Connection Pooler (Transaction mode)
-        try:
-            self.connection_pool = ConnectionPool(
-                self.database_url,
-                min_size=1,
-                max_size=50,
-                kwargs={
-                    "autocommit": True,  # Required for Supabase transaction pooler
-                    "prepare_threshold": None,  # Disable prepared statements
-                    "options": "-c statement_timeout=30000"  # 30 second timeout
-                },
-                check=ConnectionPool.check_connection,  # Health check for connections
-                max_idle=300,  # Close idle connections after 5 minutes
-                max_lifetime=3600  # Recycle connections after 1 hour
-            )
-            logger.info("PostgreSQL connection pool created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create connection pool: {e}")
-            raise
-        
-        # Initialize database tables
-        self._init_db()
+        # Create one shared pool per process to avoid unnecessary connection growth.
+        with ThreadMappingStore._pool_lock:
+            if ThreadMappingStore._shared_pool is None:
+                # Configured for Supabase Connection Pooler (Transaction mode)
+                try:
+                    ThreadMappingStore._shared_pool = ConnectionPool(
+                        self.database_url,
+                        min_size=1,
+                        max_size=50,
+                        kwargs={
+                            "autocommit": True,  # Required for Supabase transaction pooler
+                            "prepare_threshold": None,  # Disable prepared statements
+                            "options": "-c statement_timeout=30000"  # 30 second timeout
+                        },
+                        check=ConnectionPool.check_connection,  # Health check for connections
+                        max_idle=300,  # Close idle connections after 5 minutes
+                        max_lifetime=3600  # Recycle connections after 1 hour
+                    )
+                    logger.info("PostgreSQL connection pool created successfully")
+                except Exception as e:
+                    logger.error(f"Failed to create connection pool: {e}")
+                    raise
+            
+            self.connection_pool = ThreadMappingStore._shared_pool
+            
+            # Initialize database tables once per process.
+            if not ThreadMappingStore._db_initialized:
+                self._init_db()
+                ThreadMappingStore._db_initialized = True
         
         logger.info("ThreadMappingStore initialized with PostgreSQL")
     
@@ -394,6 +404,9 @@ class ThreadMappingStore:
     
     def close(self):
         """Close all connections in the pool."""
-        if hasattr(self, 'connection_pool') and self.connection_pool:
-            self.connection_pool.close()
-            logger.info("PostgreSQL connection pool closed")
+        with ThreadMappingStore._pool_lock:
+            if ThreadMappingStore._shared_pool:
+                ThreadMappingStore._shared_pool.close()
+                ThreadMappingStore._shared_pool = None
+                ThreadMappingStore._db_initialized = False
+                logger.info("PostgreSQL connection pool closed")

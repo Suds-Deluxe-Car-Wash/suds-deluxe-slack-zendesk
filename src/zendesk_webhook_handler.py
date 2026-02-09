@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 class ZendeskWebhookHandler:
     """Handles Zendesk webhook events and posts updates to Slack."""
     
-    def __init__(self):
+    def __init__(self, thread_store: Optional[ThreadMappingStore] = None):
         """Initialize Slack client and thread store."""
         self.client = WebClient(token=Config.SLACK_BOT_TOKEN)
-        self.thread_store = ThreadMappingStore()
+        self.thread_store = thread_store or ThreadMappingStore()
         logger.info("ZendeskWebhookHandler initialized")
     
     def handle_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 class SlackHandler:
     """Handles Slack API interactions and message parsing."""
     
-    def __init__(self):
+    def __init__(self, thread_store: Optional[ThreadMappingStore] = None):
         """Initialize Slack client with bot token."""
         self.client = WebClient(token=Config.SLACK_BOT_TOKEN)
         self.zendesk_handler = ZendeskHandler()
-        self.thread_store = ThreadMappingStore()
+        self.thread_store = thread_store or ThreadMappingStore()
         logger.info("Slack client initialized successfully")
     
     def handle_workflow_message(self, message: Dict[str, Any], channel_id: str, user_id: str = None) -> Dict[str, Any]:

@@ -9,6 +9,7 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from src.config import Config
 from src.slack_handler import SlackHandler
 from src.zendesk_webhook_handler import ZendeskWebhookHandler
+from src.thread_store import ThreadMappingStore
 
 # Configure logging
 logging.basicConfig(
@@ -37,11 +38,11 @@ bolt_app = App(
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(bolt_app)
 
-# Initialize Slack handler
-slack_handler = SlackHandler()
+# Initialize shared thread store and handlers
+thread_store = ThreadMappingStore()
+slack_handler = SlackHandler(thread_store=thread_store)
 
-# Initialize Zendesk webhook handler
-zendesk_webhook_handler = ZendeskWebhookHandler()
+zendesk_webhook_handler = ZendeskWebhookHandler(thread_store=thread_store)
 
 
 @bolt_app.shortcut("create_custom_zendesk_ticket")
@@ -315,16 +316,12 @@ def schedule_monthly_cleanup():
     """Start background task to cleanup old database mappings once per month."""
     def cleanup_worker():
         """Background worker that runs cleanup every 30 days."""
-        from src.thread_store import ThreadMappingStore
-        
-        store = ThreadMappingStore()
-        
         while True:
             try:
                 # Sleep for 30 days (in seconds)
                 time.sleep(30 * 24 * 60 * 60)
                 logger.info("Running scheduled monthly cleanup of old mappings...")
-                deleted = store.cleanup_old_mappings(days=30)
+                deleted = thread_store.cleanup_old_mappings(days=30)
                 logger.info(f"Monthly cleanup completed: removed {deleted} old mappings")
             except Exception as e:
                 logger.error(f"Error in monthly cleanup task: {e}", exc_info=True)
