@@ -39,11 +39,11 @@ class ThreadMappingStore:
                         kwargs={
                             "autocommit": True,  # Required for Supabase transaction pooler
                             "prepare_threshold": None,  # Disable prepared statements
-                            "options": "-c statement_timeout=30000"  # 30 second timeout
+                            "options": "-c statement_timeout=15000"  # 15 second timeout
                         },
                         check=ConnectionPool.check_connection,  # Health check for connections
-                        max_idle=300,  # Close idle connections after 5 minutes
-                        max_lifetime=3600  # Recycle connections after 1 hour
+                        max_idle=150,  # Close idle connections after 2.5 minutes
+                        max_lifetime=300  # Recycle connections after 5 minutes
                     )
                     logger.info("PostgreSQL connection pool created successfully")
                 except Exception as e:
