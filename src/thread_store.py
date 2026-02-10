@@ -35,7 +35,7 @@ class ThreadMappingStore:
                     ThreadMappingStore._shared_pool = ConnectionPool(
                         self.database_url,
                         min_size=1,
-                        max_size=50,
+                        max_size=100,
                         kwargs={
                             "autocommit": True,  # Required for Supabase transaction pooler
                             "prepare_threshold": None,  # Disable prepared statements
