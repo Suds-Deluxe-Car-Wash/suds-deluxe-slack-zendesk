@@ -102,6 +102,11 @@ DATABASE_URL=postgresql://postgres.xxxxx:[PASSWORD]@aws-0-us-east-1.pooler.supab
 PORT=3000
 ENVIRONMENT=production
 LOG_LEVEL=INFO
+
+# Optional: Slack error log alerts (Render -> Slack)
+SLACK_LOG_ALERTS_ENABLED=true
+SLACK_LOG_ALERT_CHANNEL=C01234ABCD
+SLACK_LOG_ALERT_LEVEL=ERROR
 ```
 
 ### 4. Configure Slack App
@@ -204,6 +209,19 @@ Render free tier sleeps after 15 minutes. Use cron-job.org:
 1. Go to [cron-job.org](https://cron-job.org)
 2. Create cron job: `https://your-app.onrender.com/health`
 3. Schedule: Every 10 minutes
+
+### Render Log Alerts to Slack
+
+To receive Slack alerts when your app logs errors on Render:
+
+1. Create or choose an alerts channel in Slack (example: `#render-alerts`)
+2. Add your bot to that channel
+3. In Render environment variables, set:
+   - `SLACK_LOG_ALERTS_ENABLED=true`
+   - `SLACK_LOG_ALERT_CHANNEL=<channel_id>`
+   - `SLACK_LOG_ALERT_LEVEL=ERROR` (or `CRITICAL`)
+
+When enabled, any Python log at or above the configured level is posted to the alert channel with service, instance, logger, timestamp, and message.
 
 ## Usage
 

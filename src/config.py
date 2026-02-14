@@ -27,6 +27,11 @@ class Config:
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
+    # Log Alert Configuration
+    SLACK_LOG_ALERTS_ENABLED = os.getenv("SLACK_LOG_ALERTS_ENABLED", "false").lower() == "true"
+    SLACK_LOG_ALERT_CHANNEL = os.getenv("SLACK_LOG_ALERT_CHANNEL")
+    SLACK_LOG_ALERT_LEVEL = os.getenv("SLACK_LOG_ALERT_LEVEL", "ERROR").upper()
+    
     @classmethod
     def validate(cls) -> List[str]:
         """Validate that all required configuration is present."""

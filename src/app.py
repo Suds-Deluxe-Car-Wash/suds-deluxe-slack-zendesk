@@ -9,6 +9,7 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from src.config import Config
 from src.slack_handler import SlackHandler
 from src.zendesk_webhook_handler import ZendeskWebhookHandler
+from src.slack_log_alert_handler import SlackLogAlertHandler
 from src.thread_store import ThreadMappingStore
 
 # Configure logging
@@ -21,12 +22,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def configure_slack_log_alerts():
+    """Attach Slack error alert logging handler if configured."""
+    if not Config.SLACK_LOG_ALERTS_ENABLED:
+        return
+    
+    if not Config.SLACK_LOG_ALERT_CHANNEL:
+        logger.warning("SLACK_LOG_ALERTS_ENABLED is true but SLACK_LOG_ALERT_CHANNEL is not set")
+        return
+    
+    level = getattr(logging, Config.SLACK_LOG_ALERT_LEVEL, logging.ERROR)
+    root_logger = logging.getLogger()
+    
+    # Avoid duplicate handlers on reloads.
+    for existing_handler in root_logger.handlers:
+        if isinstance(existing_handler, SlackLogAlertHandler):
+            return
+    
+    slack_handler = SlackLogAlertHandler(
+        token=Config.SLACK_BOT_TOKEN,
+        channel=Config.SLACK_LOG_ALERT_CHANNEL,
+        level=level
+    )
+    slack_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(slack_handler)
+    
+    logger.info(
+        f"Slack log alerts enabled for channel {Config.SLACK_LOG_ALERT_CHANNEL} "
+        f"at level {logging.getLevelName(level)}"
+    )
+
 # Validate configuration before starting
 missing_vars = Config.validate()
 if missing_vars:
     logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
     logger.error("Please copy .env.example to .env and fill in the values")
     sys.exit(1)
+
+configure_slack_log_alerts()
 
 # Initialize Slack Bolt app
 bolt_app = App(
