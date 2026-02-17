@@ -36,11 +36,11 @@ class ThreadMappingStore:
                         self.database_url,
                         min_size=1,
                         max_size=40,
-                        timeout=7,
+                        timeout=15,
                         kwargs={
                             "autocommit": True,  # Required for Supabase transaction pooler
                             "prepare_threshold": None,  # Disable prepared statements
-                            "connect_timeout": 7,  # Fail fast if DB connection cannot be established
+                            "connect_timeout": 15,  # Fail fast if DB connection cannot be established
                             "options": "-c statement_timeout=15000"  # 15 second timeout
                         },
                         check=ConnectionPool.check_connection,  # Health check for connections
