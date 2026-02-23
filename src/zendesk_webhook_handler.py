@@ -34,17 +34,17 @@ class ZendeskWebhookHandler:
             if not ticket_id:
                 logger.warning("No ticket ID found in webhook payload")
                 return {"success": False, "error": "No ticket ID"}
+
+            # Parse first: many Zendesk triggers carry no comment to sync to Slack.
+            messages = self._parse_webhook_event(payload)
+            if not messages:
+                logger.debug(f"No messages to post for ticket #{ticket_id}")
+                return {"success": True, "skipped": True}
             
             # Get Slack thread info for this ticket
             thread_info = self.thread_store.get_thread_info(ticket_id)
             if not thread_info:
                 logger.info(f"No Slack thread found for ticket #{ticket_id} - skipping")
-                return {"success": True, "skipped": True}
-            
-            # Parse the event and create message
-            messages = self._parse_webhook_event(payload)
-            if not messages:
-                logger.debug(f"No messages to post for ticket #{ticket_id}")
                 return {"success": True, "skipped": True}
             
             # Post each message to Slack thread

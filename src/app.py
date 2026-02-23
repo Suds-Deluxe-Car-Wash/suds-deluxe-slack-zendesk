@@ -199,14 +199,8 @@ def handle_message_events(event, client, logger):
             logger.debug(f"Skipping message from non-allowed channel {channel_id}")
             return
         
-        # Use message timestamp (ts) for deduplication - this is unique per message
-        # and doesn't change across Slack webhook retries (unlike event_id)
-        message_ts = event.get("ts")
-        if message_ts and slack_handler.thread_store.is_event_processed(message_ts):
-            logger.debug(f"Message {message_ts} already processed, skipping duplicate")
-            return
-        
         # Determine if this is a workflow message or a thread reply
+        message_ts = event.get("ts")
         is_thread_reply = ("thread_ts" in event and 
                           event.get("thread_ts") != event.get("ts"))
         
@@ -214,6 +208,11 @@ def handle_message_events(event, client, logger):
             # Skip bot messages to avoid posting our own ticket links to Zendesk
             if "bot_id" in event or event.get("subtype") == "bot_message":
                 logger.debug(f"Skipping bot message in thread {event.get('thread_ts')}")
+                return
+
+            # Only dedupe events that can actually hit DB/Zendesk logic.
+            if message_ts and slack_handler.thread_store.is_event_processed(message_ts):
+                logger.debug(f"Message {message_ts} already processed, skipping duplicate")
                 return
             
             # This is a user reply in a thread - try to add to Zendesk
@@ -231,6 +230,11 @@ def handle_message_events(event, client, logger):
             # Check if it's a workflow message that should auto-create a ticket
             if _is_workflow_message(event):
                 logger.info(f"Detected workflow message in channel {channel_id}, auto-creating ticket")
+
+                # Only dedupe workflow events after confirming it's actually a workflow message.
+                if message_ts and slack_handler.thread_store.is_event_processed(message_ts):
+                    logger.debug(f"Message {message_ts} already processed, skipping duplicate")
+                    return
                 
                 # Deduplication happens atomically in handle_workflow_message via store_mapping
                 # which uses PRIMARY KEY constraint on thread_ts for race-condition-safe prevention
