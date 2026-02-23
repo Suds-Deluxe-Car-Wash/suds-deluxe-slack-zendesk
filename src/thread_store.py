@@ -114,9 +114,11 @@ class ThreadMappingStore:
     
     @contextmanager
     def _get_connection(self):
-        """Get a connection from the pool with timeout diagnostics."""
+        """Get a connection from the pool with timeout diagnostics. Logs pool stats before and after."""
+        logger.info(f"[POOL] Before acquiring connection: {self._get_pool_stats()}")
         try:
             with self.connection_pool.connection() as conn:
+                logger.info(f"[POOL] Connection acquired: {self._get_pool_stats()}")
                 yield conn
         except PoolTimeout as e:
             logger.error(
@@ -126,6 +128,8 @@ class ThreadMappingStore:
                 e
             )
             raise
+        finally:
+            logger.info(f"[POOL] After releasing connection: {self._get_pool_stats()}")
     
     def _return_connection(self, conn):
         """Return a connection to the pool (handled by context manager in psycopg3)."""
