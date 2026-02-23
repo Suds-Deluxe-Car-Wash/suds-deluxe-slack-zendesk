@@ -164,6 +164,23 @@ def _get_user_friendly_error(error_message: str) -> str:
     return "Failed to create ticket. Please try again."
 
 
+def _should_trigger_slack_retry(error_message: str) -> bool:
+    """
+    Decide whether to re-raise and ask Slack for automatic retry.
+
+    For DB connection pool exhaustion/timeouts, retries tend to amplify load.
+    """
+    error_lower = (error_message or "").lower()
+    no_retry_markers = [
+        "couldn't get a connection",
+        "pool timeout",
+        "too many clients",
+        "remaining connection slots are reserved",
+        "failed to get ticket id for thread",
+    ]
+    return not any(marker in error_lower for marker in no_retry_markers)
+
+
 @bolt_app.event("message")
 def handle_message_events(event, client, logger):
     """
@@ -234,10 +251,15 @@ def handle_message_events(event, client, logger):
                     else:
                         logger.info(f"Auto-created ticket #{result['ticket_id']} from workflow message")
                 else:
-                    # Ticket creation failed - raise exception to trigger Slack retry
+                    # Ticket creation failed. Retries can amplify DB pool pressure, so gate them.
                     error_msg = result.get('error', 'Unknown error')
-                    logger.error(f"Failed to auto-create ticket: {error_msg} - triggering Slack retry")
-                    raise Exception(f"Ticket creation failed: {error_msg}")
+                    if _should_trigger_slack_retry(error_msg):
+                        logger.error(f"Failed to auto-create ticket: {error_msg} - triggering Slack retry")
+                        raise Exception(f"Ticket creation failed: {error_msg}")
+                    logger.error(
+                        "Failed to auto-create ticket without Slack retry (connection pressure guard): %s",
+                        error_msg
+                    )
         
     except Exception as e:
         logger.error(f"Error processing message event: {e}", exc_info=True)

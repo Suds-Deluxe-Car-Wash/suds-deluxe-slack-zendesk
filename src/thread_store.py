@@ -2,10 +2,12 @@
 import os
 import logging
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 import psycopg
 from psycopg_pool import ConnectionPool
+from psycopg_pool import PoolTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,36 @@ class ThreadMappingStore:
     _shared_pool = None
     _pool_lock = threading.Lock()
     _db_initialized = False
+
+    @staticmethod
+    def _get_int_env(var_name: str, default: int, min_value: int = 1) -> int:
+        """Read and validate integer env vars used for DB pool tuning."""
+        raw = os.getenv(var_name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+            if value < min_value:
+                raise ValueError(f"must be >= {min_value}")
+            return value
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %s", var_name, raw, default)
+            return default
+
+    @staticmethod
+    def _get_float_env(var_name: str, default: float, min_value: float = 0.1) -> float:
+        """Read and validate float env vars used for DB pool tuning."""
+        raw = os.getenv(var_name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+            if value < min_value:
+                raise ValueError(f"must be >= {min_value}")
+            return value
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %s", var_name, raw, default)
+            return default
     
     def __init__(self):
         """
@@ -26,28 +58,47 @@ class ThreadMappingStore:
         
         if not self.database_url:
             raise ValueError("DATABASE_URL environment variable is required")
+
+        # Render-friendly defaults; override via env when needed.
+        self.pool_min_size = self._get_int_env("DB_POOL_MIN_SIZE", 2, min_value=1)
+        self.pool_max_size = self._get_int_env("DB_POOL_MAX_SIZE", 5, min_value=self.pool_min_size)
+        self.pool_acquire_timeout = self._get_float_env("DB_POOL_ACQUIRE_TIMEOUT", 8.0, min_value=0.1)
+        self.db_connect_timeout = self._get_int_env("DB_CONNECT_TIMEOUT", 5, min_value=1)
+        self.db_statement_timeout_ms = self._get_int_env("DB_STATEMENT_TIMEOUT_MS", 15000, min_value=1000)
+        self.db_pool_max_idle = self._get_int_env("DB_POOL_MAX_IDLE_SECONDS", 120, min_value=1)
+        self.db_pool_max_lifetime = self._get_int_env("DB_POOL_MAX_LIFETIME_SECONDS", 900, min_value=30)
         
         # Create one shared pool per process to avoid unnecessary connection growth.
         with ThreadMappingStore._pool_lock:
             if ThreadMappingStore._shared_pool is None:
-                # Configured for Supabase Connection Pooler (Transaction mode)
+                # Configured for hosted PostgreSQL with conservative defaults.
                 try:
                     ThreadMappingStore._shared_pool = ConnectionPool(
                         self.database_url,
-                        min_size=1,
-                        max_size=40,
-                        timeout=15,
+                        min_size=self.pool_min_size,
+                        max_size=self.pool_max_size,
+                        timeout=self.pool_acquire_timeout,
                         kwargs={
-                            "autocommit": True,  # Required for Supabase transaction pooler
+                            "autocommit": True,
                             "prepare_threshold": None,  # Disable prepared statements
-                            "connect_timeout": 15,  # Fail fast if DB connection cannot be established
-                            "options": "-c statement_timeout=15000"  # 15 second timeout
+                            "connect_timeout": self.db_connect_timeout,
+                            "options": f"-c statement_timeout={self.db_statement_timeout_ms}"
                         },
                         check=ConnectionPool.check_connection,  # Health check for connections
-                        max_idle=150,  # Close idle connections after 2.5 minutes
-                        max_lifetime=1800  # Recycle connections after 30 minutes
+                        max_idle=self.db_pool_max_idle,
+                        max_lifetime=self.db_pool_max_lifetime
                     )
-                    logger.info("PostgreSQL connection pool created successfully")
+                    logger.info(
+                        "PostgreSQL connection pool created: min=%s max=%s acquire_timeout=%.2fs "
+                        "connect_timeout=%ss statement_timeout_ms=%s max_idle=%ss max_lifetime=%ss",
+                        self.pool_min_size,
+                        self.pool_max_size,
+                        self.pool_acquire_timeout,
+                        self.db_connect_timeout,
+                        self.db_statement_timeout_ms,
+                        self.db_pool_max_idle,
+                        self.db_pool_max_lifetime
+                    )
                 except Exception as e:
                     logger.error(f"Failed to create connection pool: {e}")
                     raise
@@ -61,18 +112,36 @@ class ThreadMappingStore:
         
         logger.info("ThreadMappingStore initialized with PostgreSQL")
     
+    @contextmanager
     def _get_connection(self):
-        """Get a connection from the pool."""
-        return self.connection_pool.connection()
+        """Get a connection from the pool with timeout diagnostics."""
+        try:
+            with self.connection_pool.connection() as conn:
+                yield conn
+        except PoolTimeout as e:
+            logger.error(
+                "DB pool acquisition timeout after %.2fs while acquiring connection. pool_stats=%s error=%s",
+                self.pool_acquire_timeout,
+                self._get_pool_stats(),
+                e
+            )
+            raise
     
     def _return_connection(self, conn):
         """Return a connection to the pool (handled by context manager in psycopg3)."""
         pass  # psycopg3 uses context managers, no manual return needed
+
+    def _get_pool_stats(self) -> dict:
+        """Get connection pool stats for diagnostics."""
+        try:
+            return self.connection_pool.get_stats()
+        except Exception as e:
+            return {"stats_error": str(e)}
     
     def _init_db(self):
         """Create database tables if they don't exist."""
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     # Thread mappings table
                     cursor.execute("""
@@ -121,7 +190,7 @@ class ThreadMappingStore:
             False if another ticket already exists for this thread (duplicate)
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     # Try to insert - if thread_ts exists, DO NOTHING and return nothing
                     cursor.execute("""
@@ -164,7 +233,7 @@ class ThreadMappingStore:
             False if another request already claimed it (duplicate)
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     # First, clean up stale placeholders (older than 30 seconds)
                     # This allows quick retry after connection failures during cold starts
@@ -216,7 +285,7 @@ class ThreadMappingStore:
             True if updated successfully
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         UPDATE thread_mappings 
@@ -246,7 +315,7 @@ class ThreadMappingStore:
             Zendesk ticket ID if found, None otherwise
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         SELECT ticket_id FROM thread_mappings 
@@ -256,6 +325,15 @@ class ThreadMappingStore:
                     result = cursor.fetchone()
                     return result[0] if result else None
                     
+        except PoolTimeout as e:
+            logger.error(
+                "Failed to get ticket ID for thread %s: pool timeout after %.2fs. pool_stats=%s error=%s",
+                thread_ts,
+                self.pool_acquire_timeout,
+                self._get_pool_stats(),
+                e
+            )
+            return None
         except Exception as e:
             logger.error(f"Failed to get ticket ID for thread {thread_ts}: {e}")
             return None
@@ -271,7 +349,7 @@ class ThreadMappingStore:
             Dictionary with thread_ts and channel_id if found, None otherwise
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         SELECT thread_ts, channel_id FROM thread_mappings 
@@ -301,7 +379,7 @@ class ThreadMappingStore:
             True if event was already processed, False otherwise
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         SELECT 1 FROM processed_events 
@@ -325,7 +403,7 @@ class ThreadMappingStore:
             True if marked successfully, False otherwise
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     # PostgreSQL uses ON CONFLICT DO NOTHING for INSERT OR IGNORE
                     cursor.execute("""
@@ -354,7 +432,7 @@ class ThreadMappingStore:
         try:
             cutoff_date = datetime.now() - timedelta(days=days)
             
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     # Delete old thread mappings
                     cursor.execute("""
@@ -387,7 +465,7 @@ class ThreadMappingStore:
             Dictionary with mapping counts and other stats
         """
         try:
-            with self.connection_pool.connection() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT COUNT(*) FROM thread_mappings")
                     total_mappings = cursor.fetchone()[0]
