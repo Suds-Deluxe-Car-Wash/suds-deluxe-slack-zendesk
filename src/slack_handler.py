@@ -1,6 +1,7 @@
 """Slack message shortcut handler and message parsing."""
 import logging
 import re
+import threading
 from typing import Dict, Any, Optional, List
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -19,6 +20,10 @@ class SlackHandler:
         self.client = WebClient(token=Config.SLACK_BOT_TOKEN)
         self.zendesk_handler = ZendeskHandler()
         self.thread_store = thread_store or ThreadMappingStore()
+        # Semaphore to gate concurrent DB-heavy request handlers (ticket creation flows)
+        # BoundedSemaphore prevents exceeding the configured max and is shared
+        # across the single SlackHandler instance created in `app.py`.
+        self.db_semaphore = threading.BoundedSemaphore(Config.DB_MAX_CONCURRENT_REQUESTS)
         logger.info("Slack client initialized successfully")
     
     def handle_workflow_message(self, message: Dict[str, Any], channel_id: str, user_id: str = None) -> Dict[str, Any]:
@@ -33,7 +38,20 @@ class SlackHandler:
         Returns:
             Response dictionary with success status and message
         """
+        # Gate the entire ticket creation flow with a semaphore to reduce DB pressure
+        acquired = False
         try:
+            logger.info(f"[SEMAPHORE] Waiting for DB concurrency slot (max={Config.DB_MAX_CONCURRENT_REQUESTS})")
+            acquired = self.db_semaphore.acquire(timeout=Config.DB_SEMAPHORE_ACQUIRE_TIMEOUT)
+            if not acquired:
+                logger.warning("[SEMAPHORE] Could not acquire DB slot within timeout; rejecting to avoid connection pressure")
+                return {
+                    "success": False,
+                    "error": "Service busy; too many concurrent ticket creation requests. Please try again shortly."
+                }
+
+            logger.info(f"[SEMAPHORE] Acquired slot (max={Config.DB_MAX_CONCURRENT_REQUESTS})")
+
             message_ts = message.get("ts")
             
             # ATOMIC CLAIM: Reserve this thread BEFORE doing anything else
@@ -60,7 +78,7 @@ class SlackHandler:
                             "duplicate_prevented": True,
                             "message": "Ticket creation in progress by another request"
                         }
-            
+
             # Validate channel is allowed
             if not is_channel_allowed(channel_id):
                 logger.warning(f"Workflow message in unauthorized channel: {channel_id}")
@@ -68,7 +86,7 @@ class SlackHandler:
                     "success": False,
                     "error": "This integration is not enabled for this channel."
                 }
-            
+
             # Get form configuration for this channel
             form_config = get_form_config_for_channel(channel_id)
             if not form_config:
@@ -77,28 +95,28 @@ class SlackHandler:
                     "success": False,
                     "error": "No form configuration found for this channel."
                 }
-            
+
             logger.info(f"Using form: {form_config['name']}")
-            
+
             # Parse the Slack workflow message
             parsed_data = self.parse_workflow_message(message, channel_id)
-            
+
             if not parsed_data:
                 return {
                     "success": False,
                     "error": "Could not parse message data. Please ensure this is a workflow form message."
                 }
-            
+
             # Build custom fields mapping for Zendesk using form config
             custom_fields = self._build_zendesk_custom_fields(parsed_data, form_config)
-            
+
             # Build subject using form template
             subject = self._build_ticket_subject(parsed_data, form_config)
             parsed_data["subject"] = subject
-            
+
             # Determine group assignment based on issue type
             group_id = self._determine_group(parsed_data, form_config)
-            
+
             # Create Zendesk ticket with custom fields and specific form
             ticket_result = self.zendesk_handler.create_ticket_from_slack_message(
                 parsed_data,
@@ -106,13 +124,13 @@ class SlackHandler:
                 ticket_form_id=form_config.get("zendesk_form_id"),
                 group_id=group_id
             )
-            
+
             if not ticket_result.get("success"):
                 return {
                     "success": False,
                     "error": f"Failed to create ticket: {ticket_result.get('error', 'Unknown error')}"
                 }
-            
+
             # Post ticket link back to Slack thread
             self.post_ticket_link_to_thread(
                 channel_id=channel_id,
@@ -121,31 +139,39 @@ class SlackHandler:
                 ticket_url=ticket_result["ticket_url"],
                 user_id=user_id
             )
-            
+
             # Update the claimed thread with the actual ticket ID
             if message_ts:
                 updated = self.thread_store.update_ticket_mapping(
                     thread_ts=message_ts,
                     ticket_id=ticket_result["ticket_id"]
                 )
-                
+
                 if not updated:
                     logger.error(f"Failed to update ticket mapping for {message_ts} - this should not happen!")
-            
+
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
-            
+
             return {
                 "success": True,
                 "ticket_id": ticket_result["ticket_id"],
                 "ticket_url": ticket_result["ticket_url"]
             }
-            
+
         except Exception as e:
             logger.error(f"Error handling workflow message: {e}", exc_info=True)
             return {
                 "success": False,
                 "error": str(e)
             }
+        finally:
+            if acquired:
+                try:
+                    self.db_semaphore.release()
+                    logger.info("[SEMAPHORE] Released DB concurrency slot")
+                except ValueError:
+                    # Should not happen with BoundedSemaphore, but guard just in case
+                    logger.exception("[SEMAPHORE] Failed to release semaphore (unexpected)")
     
     def handle_message_shortcut(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """

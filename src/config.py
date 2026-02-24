@@ -32,6 +32,10 @@ class Config:
     SLACK_LOG_ALERT_CHANNEL = os.getenv("SLACK_LOG_ALERT_CHANNEL")
     SLACK_LOG_ALERT_LEVEL = os.getenv("SLACK_LOG_ALERT_LEVEL", "ERROR").upper()
     
+    # Application-level concurrency gating for DB-heavy operations
+    # Limits how many concurrent request handlers may perform DB work.
+    DB_MAX_CONCURRENT_REQUESTS = int(os.getenv("DB_MAX_CONCURRENT_REQUESTS", "10"))
+    DB_SEMAPHORE_ACQUIRE_TIMEOUT = int(os.getenv("DB_SEMAPHORE_ACQUIRE_TIMEOUT", "10"))
     @classmethod
     def validate(cls) -> List[str]:
         """Validate that all required configuration is present."""
