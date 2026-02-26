@@ -86,39 +86,96 @@ class ZendeskWebhookHandler:
         Returns:
             List of formatted message strings to post to Slack
         """
-        messages = []
-        
-        # Get current comment/update
-        current_comment = payload.get("current_comment")
-        if current_comment:
-            # Skip comments from "Slack Automation" to prevent loops
-            author_name = current_comment.get("author_name", "")
+        messages: List[str] = []
+
+        def _format_attachments(attachments):
+            formatted = []
+            for a in attachments or []:
+                name = a.get("file_name") or a.get("name") or a.get("filename") or "attachment"
+                url = (
+                    a.get("content_url")
+                    or a.get("content_url_https")
+                    or a.get("content_url_http")
+                    or a.get("url")
+                    or a.get("attachment_url")
+                    or a.get("public_url")
+                )
+                if url:
+                    formatted.append(f"<{url}|{name}>")
+                else:
+                    formatted.append(name)
+            return formatted
+
+        def _process_comment_obj(comment_obj):
+            if not comment_obj:
+                return
+            author_name = comment_obj.get("author_name", "") or comment_obj.get("author", {}).get("name", "")
             if author_name == "Slack Automation":
                 logger.debug("Skipping comment from Slack Automation (loop prevention)")
-                return messages
-            
-            # Skip comments that originated from Slack (have our signature)
-            body = current_comment.get("body", "").strip()
+                return
+
+            body = (
+                comment_obj.get("body")
+                or comment_obj.get("plain_body")
+                or comment_obj.get("html_body")
+                or ""
+            )
+            if not isinstance(body, str):
+                body = str(body)
+
             if "[Posted from Slack]" in body:
                 logger.debug("Skipping comment from Slack thread (loop prevention)")
-                return messages
-            
-            is_public = current_comment.get("public", True)
-            
+                return
+
+            is_public = comment_obj.get("public", True)
+            attachments = comment_obj.get("attachments") or comment_obj.get("uploads") or []
+
+            attach_links = _format_attachments(attachments)
+
             if body:
                 if is_public:
-                    # Public comment from customer or agent
-                    author = current_comment.get("author_name", "Unknown")
-                    author_email = current_comment.get("author_email", "")
+                    author_email = comment_obj.get("author_email", "") or (comment_obj.get("author", {}).get("email") if isinstance(comment_obj.get("author"), dict) else "")
+                    author_display = author_name or (comment_obj.get("author", {}).get("name") if isinstance(comment_obj.get("author"), dict) else author_name) or "Unknown"
                     if author_email:
-                        messages.append(f"💬 {author} ({author_email}) replied:\n{body}")
+                        prefix = f"💬 {author_display} ({author_email}) replied:\n"
                     else:
-                        messages.append(f"💬 {author} replied:\n{body}")
+                        prefix = f"💬 {author_display} replied:\n"
+                    msg = f"{prefix}{body}"
+                    if attach_links:
+                        msg += "\n\nAttachments:\n" + "\n".join(f"- {l}" for l in attach_links)
+                    messages.append(msg)
                 else:
-                    # Internal note from agent
-                    author = current_comment.get("author_name", "Agent")
-                    messages.append(f"🔒 Internal note from {author}:\n{body}")
-        
+                    prefix = f"🔒 Internal note from {author_display}:\n"
+                    msg = f"{prefix}{body}"
+                    if attach_links:
+                        msg += "\n\nAttachments:\n" + "\n".join(f"- {l}" for l in attach_links)
+                    messages.append(msg)
+
+        current_comment = payload.get("current_comment") or payload.get("comment")
+        if current_comment:
+            _process_comment_obj(current_comment)
+
+        audit = payload.get("audit") or payload.get("audits") or payload.get("event") or payload.get("ticket_audit")
+        if audit:
+            events = []
+            if isinstance(audit, dict):
+                events = audit.get("events", [])
+            elif isinstance(audit, list):
+                for a in audit:
+                    if isinstance(a, dict):
+                        events.extend(a.get("events", []) or [])
+            for ev in events:
+                ev_type = ev.get("type", "").lower()
+                if ev_type == "comment":
+                    comment_obj = ev.get("comment") or ev
+                    _process_comment_obj(comment_obj)
+
+        ticket = payload.get("ticket") or {}
+        if ticket and isinstance(ticket, dict):
+            t_comment = ticket.get("comment")
+            if t_comment:
+                _process_comment_obj(t_comment)
+
         return messages
     
     def _post_to_slack_thread(self, channel_id: str, thread_ts: str, message: str) -> bool:

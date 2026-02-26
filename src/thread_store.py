@@ -312,11 +312,18 @@ class ThreadMappingStore:
         """
         Retrieve Zendesk ticket ID for a given Slack thread.
         
+        Called frequently when converting Slack thread activity into Zendesk
+        comments.  During the ticket-creation race we insert a placeholder value
+        of ``-1``; this method treats that sentinel value as “not found” and
+        returns ``None`` so callers don't attempt to post to a non-existent
+        ticket.
+        
         Args:
             thread_ts: Slack thread timestamp
             
         Returns:
-            Zendesk ticket ID if found, None otherwise
+            Zendesk ticket ID if found (and not a placeholder), ``None``
+            otherwise.
         """
         try:
             with self._get_connection() as conn:
@@ -327,7 +334,16 @@ class ThreadMappingStore:
                     """, (thread_ts,))
                     
                     result = cursor.fetchone()
-                    return result[0] if result else None
+                    if not result:
+                        return None
+                    ticket_id = result[0]
+                    if ticket_id == -1:
+                        logger.debug(
+                            "get_ticket_id(%s) found placeholder (-1); returning None",
+                            thread_ts,
+                        )
+                        return None
+                    return ticket_id
                     
         except PoolTimeout as e:
             logger.error(

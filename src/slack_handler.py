@@ -338,10 +338,13 @@ class SlackHandler:
             thread_ts = message_event.get("thread_ts")
             user_id = message_event.get("user")
             text = message_event.get("text", "")
+            files = message_event.get("files", []) or []
+            attachments = message_event.get("attachments", []) or []
             
             # Get ticket ID from thread mapping
             ticket_id = self.thread_store.get_ticket_id(thread_ts)
-            if not ticket_id:
+            # ``get_ticket_id`` returns None when thread is unclaimed or still has the -1 placeholder
+            if ticket_id is None:
                 logger.warning(f"No ticket found for thread {thread_ts}")
                 return False
             
@@ -355,8 +358,29 @@ class SlackHandler:
                     mentioned_username = self._get_user_name(mentioned_user_id)
                     text = text.replace(f'<@{mentioned_user_id}>', f'@{mentioned_username}')
             
-            # Format comment with username, message, and signature to prevent webhook loops
-            comment_text = f"💬 Thread Reply from {user_name}:\n\n{text}\n\n---\n[Posted from Slack]"
+            # collect attachment links
+            attachment_lines = []
+            for f in files:
+                name = f.get("name") or f.get("title") or f.get("filetype") or "file"
+                link = f.get("permalink") or f.get("permalink_public") or f.get("url_private") or f.get("url")
+                if link:
+                    attachment_lines.append(f"- {name}: {link}")
+                else:
+                    attachment_lines.append(f"- {name}")
+            for a in attachments:
+                title = a.get("title")
+                tlink = a.get("title_link")
+                if title and tlink:
+                    attachment_lines.append(f"- {title}: {tlink}")
+                elif title:
+                    attachment_lines.append(f"- {title}")
+
+            # Format comment with username, message, attachments, and signature
+            comment_parts = [f"💬 Thread Reply from {user_name}:\n\n{text}"]
+            if attachment_lines:
+                comment_parts.append("\nAttachments:\n" + "\n".join(attachment_lines))
+            comment_parts.append("\n---\n[Posted from Slack]")
+            comment_text = "\n".join(comment_parts)
             
             # Add as internal note to Zendesk ticket
             success = self.zendesk_handler.add_comment_to_ticket(ticket_id, comment_text)
