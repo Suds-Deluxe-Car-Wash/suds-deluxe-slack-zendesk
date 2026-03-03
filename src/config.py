@@ -31,7 +31,7 @@ class Config:
     # Log Alert Configuration
     SLACK_LOG_ALERTS_ENABLED = os.getenv("SLACK_LOG_ALERTS_ENABLED", "false").lower() == "true"
     SLACK_LOG_ALERT_CHANNEL = os.getenv("SLACK_LOG_ALERT_CHANNEL")
-    SLACK_LOG_ALERT_LEVEL = os.getenv("SLACK_LOG_ALERT_LEVEL", "ERROR").upper()
+    SLACK_LOG_ALERT_LEVEL = os.getenv("SLACK_LOG_ALERT_LEVEL", "WARNING").upper()
     
     # Application-level concurrency gating for DB-heavy operations
     # Limits how many concurrent request handlers may perform DB work.

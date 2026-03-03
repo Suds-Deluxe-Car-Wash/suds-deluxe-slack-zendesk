@@ -116,7 +116,7 @@ LOG_LEVEL=INFO
 # Optional: Slack error log alerts (Render -> Slack)
 SLACK_LOG_ALERTS_ENABLED=true
 SLACK_LOG_ALERT_CHANNEL=C01234ABCD
-SLACK_LOG_ALERT_LEVEL=ERROR
+SLACK_LOG_ALERT_LEVEL=WARNING
 ```
 
 ### 4. Configure Slack App
@@ -226,6 +226,7 @@ Render free tier sleeps after 15 minutes. Use cron-job.org:
 3. Schedule: Every 10 minutes
 
 For incident review, use `https://your-app.onrender.com/diagnostics` to inspect queue depth and DB pool stats.
+The app also logs request timing for `/slack/events` and `/zendesk/webhook`; use those duration logs to confirm Slack acknowledgements stay under 3 seconds.
 
 ### Render Log Alerts to Slack
 
@@ -236,9 +237,10 @@ To receive Slack alerts when your app logs errors on Render:
 3. In Render environment variables, set:
    - `SLACK_LOG_ALERTS_ENABLED=true`
    - `SLACK_LOG_ALERT_CHANNEL=<channel_id>`
-   - `SLACK_LOG_ALERT_LEVEL=ERROR` (or `CRITICAL`)
+   - `SLACK_LOG_ALERT_LEVEL=WARNING` during rollout, then `ERROR` after stabilization
 
 When enabled, any Python log at or above the configured level is posted to the alert channel with service, instance, logger, timestamp, and message.
+During rollout, keep the threshold at `WARNING` so Slack retry and signature failures appear in the alert channel.
 
 ## Usage
 

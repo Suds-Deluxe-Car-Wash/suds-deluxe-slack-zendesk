@@ -50,32 +50,40 @@ class SlackHandler:
         event = job["event"]
         slack_event_id = job.get("slack_event_id")
         event_kind = job.get("event_kind")
-        dedupe_key = f"slack:{slack_event_id}" if slack_event_id else None
-
-        if dedupe_key:
-            processed = self.thread_store.is_event_processed(dedupe_key)
-            if processed.status == "processed":
-                logger.info("Skipping duplicate Slack delivery slack_event_id=%s", slack_event_id)
-                return
-            if processed.status == "db_error":
-                logger.error(
-                    "Unable to check Slack event dedupe state slack_event_id=%s error=%s",
-                    slack_event_id,
-                    processed.error,
-                )
-                return
-
+        message_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+        queue_depth = job.get("queue_depth")
         success = False
+        failure_reason = None
+
+        logger.info(
+            "Slack job started slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s queue_depth=%s",
+            slack_event_id,
+            event_kind,
+            message_ts,
+            thread_ts,
+            queue_depth,
+        )
 
         if event_kind == "thread_reply":
             result = self.add_thread_reply_to_ticket(event)
             success = result.get("success", False)
             if not success:
+                failure_reason = result.get("error") or result.get("status") or "thread_reply_failed"
                 logger.warning(
                     "Thread reply processing incomplete slack_event_id=%s thread_ts=%s status=%s",
                     slack_event_id,
-                    event.get("thread_ts"),
+                    thread_ts,
                     result.get("status"),
+                )
+            else:
+                logger.info(
+                    "Slack job completed slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s ticket_id=%s",
+                    slack_event_id,
+                    event_kind,
+                    message_ts,
+                    thread_ts,
+                    result.get("ticket_id"),
                 )
         elif event_kind == "workflow_message":
             result = self.handle_workflow_message(
@@ -86,33 +94,47 @@ class SlackHandler:
             success = result.get("success", False)
             if result.get("duplicate_prevented") and result.get("reason") == "creation_in_progress":
                 success = False
+                failure_reason = "creation_in_progress"
             if success:
-                if result.get("duplicate_prevented"):
-                    logger.info(
-                        "Workflow message resolved without duplicate ticket slack_event_id=%s message_ts=%s reason=%s",
-                        slack_event_id,
-                        event.get("ts"),
-                        result.get("reason", "duplicate"),
-                    )
-                else:
-                    logger.info(
-                        "Workflow message created ticket slack_event_id=%s message_ts=%s ticket_id=%s",
-                        slack_event_id,
-                        event.get("ts"),
-                        result.get("ticket_id"),
-                    )
+                logger.info(
+                    "Slack job completed slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s ticket_id=%s duplicate_prevented=%s reason=%s",
+                    slack_event_id,
+                    event_kind,
+                    message_ts,
+                    thread_ts,
+                    result.get("ticket_id"),
+                    result.get("duplicate_prevented", False),
+                    result.get("reason"),
+                )
             else:
+                failure_reason = result.get("error") or result.get("reason") or "workflow_failed"
                 logger.error(
                     "Workflow message processing failed slack_event_id=%s message_ts=%s error=%s",
                     slack_event_id,
-                    event.get("ts"),
+                    message_ts,
                     result.get("error"),
                 )
         else:
+            failure_reason = f"unknown_event_kind:{event_kind}"
             logger.warning("Unknown Slack event job kind=%s slack_event_id=%s", event_kind, slack_event_id)
 
-        if success and dedupe_key and not self.thread_store.mark_event_processed(dedupe_key):
-            logger.error("Failed to mark Slack event processed slack_event_id=%s", slack_event_id)
+        if slack_event_id:
+            if success:
+                if not self.thread_store.mark_slack_event_completed(slack_event_id):
+                    logger.error("Failed to mark Slack event completed slack_event_id=%s", slack_event_id)
+            elif not self.thread_store.mark_slack_event_failed(slack_event_id, failure_reason or "unknown_failure"):
+                logger.error("Failed to mark Slack event failed slack_event_id=%s", slack_event_id)
+
+        if not success:
+            logger.warning(
+                "Slack job failed slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s queue_depth=%s reason=%s",
+                slack_event_id,
+                event_kind,
+                message_ts,
+                thread_ts,
+                queue_depth,
+                failure_reason,
+            )
 
     def process_shortcut_job(self, job: Dict[str, Any]) -> None:
         """Process a queued shortcut and notify the requesting user."""

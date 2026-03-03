@@ -31,6 +31,13 @@ class EventProcessedResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class SlackEventStateResult:
+    status: Literal["received", "completed", "failed", "not_found", "db_error"]
+    failed_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
 class ThreadMappingStore:
     """Manages persistent storage of Slack thread_ts to Zendesk ticket_id mappings."""
     _shared_pool = None
@@ -177,6 +184,16 @@ class ThreadMappingStore:
                         CREATE TABLE IF NOT EXISTS processed_events (
                             event_id TEXT PRIMARY KEY,
                             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS slack_event_states (
+                            event_id TEXT PRIMARY KEY,
+                            status TEXT NOT NULL,
+                            failed_reason TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
                     
@@ -454,6 +471,72 @@ class ThreadMappingStore:
         except Exception as e:
             logger.error(f"Failed to mark event {event_id} as processed: {e}")
             return False
+
+    def get_slack_event_state(self, event_id: str) -> SlackEventStateResult:
+        """Fetch lifecycle state for a Slack event envelope."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT status, failed_reason
+                        FROM slack_event_states
+                        WHERE event_id = %s
+                    """, (event_id,))
+                    result = cursor.fetchone()
+                    if not result:
+                        return SlackEventStateResult(status="not_found")
+                    return SlackEventStateResult(
+                        status=result[0],
+                        failed_reason=result[1],
+                    )
+        except Exception as e:
+            logger.error("Failed to get Slack event state for %s: %s", event_id, e)
+            return SlackEventStateResult(status="db_error", error=str(e))
+
+    def record_slack_event_received(self, event_id: str) -> SlackEventStateResult:
+        """Persist initial receipt of a Slack event if it has not been seen before."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO slack_event_states (event_id, status, failed_reason, created_at, updated_at)
+                        VALUES (%s, %s, NULL, %s, %s)
+                        ON CONFLICT (event_id) DO NOTHING
+                    """, (event_id, "received", datetime.now(), datetime.now()))
+            return self.get_slack_event_state(event_id)
+        except Exception as e:
+            logger.error("Failed to record Slack event receipt for %s: %s", event_id, e)
+            return SlackEventStateResult(status="db_error", error=str(e))
+
+    def mark_slack_event_completed(self, event_id: str) -> bool:
+        """Mark a Slack event as completed after successful worker processing."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE slack_event_states
+                        SET status = %s, failed_reason = NULL, updated_at = %s
+                        WHERE event_id = %s
+                    """, ("completed", datetime.now(), event_id))
+            return True
+        except Exception as e:
+            logger.error("Failed to mark Slack event completed for %s: %s", event_id, e)
+            return False
+
+    def mark_slack_event_failed(self, event_id: str, failed_reason: str) -> bool:
+        """Mark a Slack event as failed while preserving the original receipt row."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE slack_event_states
+                        SET status = %s, failed_reason = %s, updated_at = %s
+                        WHERE event_id = %s
+                    """, ("failed", failed_reason[:1000], datetime.now(), event_id))
+            return True
+        except Exception as e:
+            logger.error("Failed to mark Slack event failed for %s: %s", event_id, e)
+            return False
     
     def cleanup_old_mappings(self, days: int = 30) -> int:
         """
@@ -508,10 +591,14 @@ class ThreadMappingStore:
                     
                     cursor.execute("SELECT COUNT(*) FROM processed_events")
                     total_events = cursor.fetchone()[0]
+
+                    cursor.execute("SELECT COUNT(*) FROM slack_event_states")
+                    total_slack_event_states = cursor.fetchone()[0]
                     
                     return {
                         "total_mappings": total_mappings,
-                        "total_processed_events": total_events
+                        "total_processed_events": total_events,
+                        "total_slack_event_states": total_slack_event_states,
                     }
                     
         except Exception as e:

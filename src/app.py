@@ -2,12 +2,13 @@
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import queue
 import sys
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request
 from slack_bolt import App
@@ -61,6 +62,11 @@ def configure_slack_log_alerts():
 
     logger.info(
         "Slack log alerts enabled for channel %s at level %s",
+        Config.SLACK_LOG_ALERT_CHANNEL,
+        logging.getLevelName(level),
+    )
+    logger.warning(
+        "Alert pipeline enabled channel=%s level=%s",
         Config.SLACK_LOG_ALERT_CHANNEL,
         logging.getLevelName(level),
     )
@@ -119,7 +125,9 @@ def _enqueue_job(job: Dict[str, Any], description: str) -> bool:
     """Enqueue a background job without blocking the Slack request thread."""
     try:
         work_queue.put_nowait(job)
-        logger.info("Enqueued job=%s queue_depth=%s", description, _queue_depth())
+        queue_depth = _queue_depth()
+        job["queue_depth"] = queue_depth
+        logger.info("Slack job enqueued job=%s queue_depth=%s", description, queue_depth)
         return True
     except queue.Full:
         logger.warning("Dropping job=%s because queue is full queue_depth=%s", description, _queue_depth())
@@ -149,6 +157,9 @@ def _slack_job_worker() -> None:
         try:
             _process_queued_job(job)
         except Exception as exc:
+            slack_event_id = job.get("slack_event_id")
+            if slack_event_id:
+                thread_store.mark_slack_event_failed(slack_event_id, f"worker_exception:{exc}")
             logger.error("Unhandled error in Slack job worker: %s", exc, exc_info=True)
         finally:
             work_queue.task_done()
@@ -236,59 +247,6 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         except Exception as exc:
             logger.error("Failed to notify shortcut user about full queue: %s", exc)
 
-
-@bolt_app.event("message")
-def handle_message_events(body, event, logger):
-    """Queue relevant Slack message events for serialized processing."""
-    channel_id = event.get("channel")
-    if not channel_id:
-        return
-
-    if not is_channel_allowed(channel_id):
-        logger.debug("Skipping message from non-allowed channel %s", channel_id)
-        return
-
-    message_ts = event.get("ts")
-    thread_ts = event.get("thread_ts")
-    slack_event_id = body.get("event_id")
-    is_thread_reply = thread_ts is not None and thread_ts != message_ts
-
-    if is_thread_reply:
-        if "bot_id" in event or event.get("subtype") == "bot_message":
-            logger.debug("Skipping bot message in thread %s", thread_ts)
-            return
-
-        _enqueue_job(
-            {
-                "job_type": "slack_message_event",
-                "event_kind": "thread_reply",
-                "slack_event_id": slack_event_id,
-                "event": event,
-                "enqueued_at": time.time(),
-            },
-            f"thread_reply slack_event_id={slack_event_id} thread_ts={thread_ts} message_ts={message_ts}",
-        )
-        return
-
-    if _is_workflow_message(event):
-        logger.info(
-            "Detected workflow message channel_id=%s slack_event_id=%s message_ts=%s",
-            channel_id,
-            slack_event_id,
-            message_ts,
-        )
-        _enqueue_job(
-            {
-                "job_type": "slack_message_event",
-                "event_kind": "workflow_message",
-                "slack_event_id": slack_event_id,
-                "event": event,
-                "enqueued_at": time.time(),
-            },
-            f"workflow slack_event_id={slack_event_id} channel_id={channel_id} message_ts={message_ts}",
-        )
-
-
 def _is_workflow_message(event: dict) -> bool:
     """
     Detect if a message is from Slack Workflow Builder.
@@ -318,6 +276,31 @@ def _is_workflow_message(event: dict) -> bool:
     return False
 
 
+def _verify_slack_signature(raw_body: str) -> bool:
+    """Verify Slack request signature for Events API deliveries."""
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    signature = request.headers.get("X-Slack-Signature")
+
+    if not timestamp or not signature:
+        return False
+
+    try:
+        request_age = abs(time.time() - int(timestamp))
+    except ValueError:
+        return False
+
+    if request_age > 300:
+        return False
+
+    basestring = f"v0:{timestamp}:{raw_body}"
+    computed = "v0=" + hmac.new(
+        Config.SLACK_SIGNING_SECRET.encode("utf-8"),
+        basestring.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(computed, signature)
+
+
 def _verify_zendesk_signature(raw_body: str) -> bool:
     """Verify Zendesk webhook signature when a signing secret is configured."""
     if not Config.ZENDESK_WEBHOOK_SIGNING_SECRET:
@@ -338,11 +321,41 @@ def _verify_zendesk_signature(raw_body: str) -> bool:
     return hmac.compare_digest(expected_signature, signature)
 
 
+def _classify_slack_event(event: Dict[str, Any]) -> Optional[str]:
+    """Return a normalized job kind for supported Slack events."""
+    channel_id = event.get("channel")
+    if not channel_id or not is_channel_allowed(channel_id):
+        return None
+
+    message_ts = event.get("ts")
+    thread_ts = event.get("thread_ts")
+    is_thread_reply = thread_ts is not None and thread_ts != message_ts
+
+    if is_thread_reply:
+        if "bot_id" in event or event.get("subtype") == "bot_message":
+            return None
+        return "thread_reply"
+
+    if _is_workflow_message(event):
+        return "workflow_message"
+
+    return None
+
+
+def _timed_json_response(payload: Dict[str, Any], status_code: int, route_name: str, started_at: float):
+    """Return a JSON response and emit request duration logging."""
+    duration_ms = round((time.time() - started_at) * 1000, 2)
+    logger.info("Request finished route=%s status_code=%s duration_ms=%s", route_name, status_code, duration_ms)
+    return jsonify(payload), status_code
+
+
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
-    """Handle Slack Events API requests."""
+    """Handle Slack Events API and Slack interactivity requests."""
+    started_at = time.time()
     retry_num = request.headers.get("X-Slack-Retry-Num")
     retry_reason = request.headers.get("X-Slack-Retry-Reason")
+    logger.info("Request started route=/slack/events content_type=%s", request.content_type)
 
     if retry_num or retry_reason:
         logger.warning(
@@ -352,38 +365,138 @@ def slack_events():
             _queue_depth(),
         )
 
-    return handler.handle(request)
+    if request.form.get("payload"):
+        logger.info("Delegating Slack interactive payload to Bolt route=/slack/events")
+        response = handler.handle(request)
+        duration_ms = round((time.time() - started_at) * 1000, 2)
+        logger.info(
+            "Request finished route=/slack/events status_code=%s duration_ms=%s",
+            response.status_code,
+            duration_ms,
+        )
+        return response
+
+    raw_body = request.get_data(cache=True, as_text=True)
+    if not _verify_slack_signature(raw_body):
+        logger.warning("Rejected Slack request due to invalid signature route=/slack/events")
+        return _timed_json_response({"error": "Invalid signature"}, 401, "/slack/events", started_at)
+
+    try:
+        payload = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        logger.warning("Received invalid JSON on /slack/events")
+        return _timed_json_response({"error": "Invalid JSON"}, 400, "/slack/events", started_at)
+    payload_type = payload.get("type")
+    if payload_type == "url_verification":
+        return _timed_json_response({"challenge": payload.get("challenge")}, 200, "/slack/events", started_at)
+
+    if payload_type != "event_callback":
+        logger.info("Ignoring unsupported Slack payload type=%s", payload_type)
+        return _timed_json_response({"ok": True, "ignored": True}, 200, "/slack/events", started_at)
+
+    event = payload.get("event") or {}
+    slack_event_id = payload.get("event_id")
+    if not slack_event_id:
+        logger.warning("Received Slack event without event_id")
+        return _timed_json_response({"ok": True, "ignored": True}, 200, "/slack/events", started_at)
+
+    event_kind = _classify_slack_event(event)
+    if not event_kind:
+        logger.info(
+            "Ignoring unsupported Slack event slack_event_id=%s event_type=%s channel_id=%s",
+            slack_event_id,
+            event.get("type"),
+            event.get("channel"),
+        )
+        return _timed_json_response({"ok": True, "ignored": True}, 200, "/slack/events", started_at)
+
+    existing_state = thread_store.get_slack_event_state(slack_event_id)
+    if existing_state.status == "db_error":
+        logger.error(
+            "Failed to read Slack ingress dedupe state slack_event_id=%s error=%s",
+            slack_event_id,
+            existing_state.error,
+        )
+        return _timed_json_response({"error": "Event state unavailable"}, 500, "/slack/events", started_at)
+
+    if existing_state.status in {"completed", "received", "failed"}:
+        logger.info(
+            "Skipping duplicate Slack event at ingress slack_event_id=%s state=%s",
+            slack_event_id,
+            existing_state.status,
+        )
+        return _timed_json_response({"ok": True, "duplicate": True}, 200, "/slack/events", started_at)
+
+    state = thread_store.record_slack_event_received(slack_event_id)
+    if state.status == "db_error":
+        logger.error(
+            "Failed to persist Slack ingress dedupe state slack_event_id=%s error=%s",
+            slack_event_id,
+            state.error,
+        )
+        return _timed_json_response({"error": "Event state unavailable"}, 500, "/slack/events", started_at)
+
+    logger.info(
+        "Accepted Slack event slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s retry_num=%s retry_reason=%s",
+        slack_event_id,
+        event_kind,
+        event.get("ts"),
+        event.get("thread_ts"),
+        retry_num,
+        retry_reason,
+    )
+
+    enqueued = _enqueue_job(
+        {
+            "job_type": "slack_message_event",
+            "event_kind": event_kind,
+            "slack_event_id": slack_event_id,
+            "event": event,
+            "enqueued_at": time.time(),
+        },
+        (
+            f"{event_kind} slack_event_id={slack_event_id} "
+            f"message_ts={event.get('ts')} thread_ts={event.get('thread_ts')}"
+        ),
+    )
+    if not enqueued:
+        thread_store.mark_slack_event_failed(slack_event_id, "queue_full")
+        return _timed_json_response({"ok": True, "queued": False}, 200, "/slack/events", started_at)
+
+    return _timed_json_response({"ok": True, "queued": True}, 200, "/slack/events", started_at)
 
 
 @flask_app.route("/zendesk/webhook", methods=["POST"])
 def zendesk_webhook():
     """Handle Zendesk webhook requests."""
+    started_at = time.time()
+    logger.info("Request started route=/zendesk/webhook")
     try:
         raw_body = request.get_data(cache=True, as_text=True)
         invocation_id = request.headers.get("X-Zendesk-Webhook-Invocation-Id")
 
         if not _verify_zendesk_signature(raw_body):
             logger.warning("Rejected Zendesk webhook due to invalid signature zendesk_invocation_id=%s", invocation_id)
-            return jsonify({"error": "Invalid signature"}), 401
+            return _timed_json_response({"error": "Invalid signature"}, 401, "/zendesk/webhook", started_at)
 
         payload = request.get_json(silent=True)
         if not payload:
             logger.warning("Received empty Zendesk webhook payload zendesk_invocation_id=%s", invocation_id)
-            return jsonify({"error": "Empty payload"}), 400
+            return _timed_json_response({"error": "Empty payload"}, 400, "/zendesk/webhook", started_at)
 
         dedupe_key = f"zendesk:{invocation_id}" if invocation_id else None
         if dedupe_key:
             processed = thread_store.is_event_processed(dedupe_key)
             if processed.status == "processed":
                 logger.info("Skipping duplicate Zendesk webhook zendesk_invocation_id=%s", invocation_id)
-                return jsonify({"status": "duplicate"}), 200
+                return _timed_json_response({"status": "duplicate"}, 200, "/zendesk/webhook", started_at)
             if processed.status == "db_error":
                 logger.error(
                     "Failed to check Zendesk webhook dedupe zendesk_invocation_id=%s error=%s",
                     invocation_id,
                     processed.error,
                 )
-                return jsonify({"error": "Webhook dedupe unavailable"}), 500
+                return _timed_json_response({"error": "Webhook dedupe unavailable"}, 500, "/zendesk/webhook", started_at)
 
         result = zendesk_webhook_handler.handle_webhook(payload, invocation_id=invocation_id)
 
@@ -393,13 +506,23 @@ def zendesk_webhook():
                     "Failed to mark Zendesk webhook processed zendesk_invocation_id=%s",
                     invocation_id,
                 )
-            return jsonify({"status": "ok", "skipped": result.get("skipped", False)}), 200
+            return _timed_json_response(
+                {"status": "ok", "skipped": result.get("skipped", False)},
+                200,
+                "/zendesk/webhook",
+                started_at,
+            )
 
-        return jsonify({"error": result.get("error", "Unknown error")}), 500
+        return _timed_json_response(
+            {"error": result.get("error", "Unknown error")},
+            500,
+            "/zendesk/webhook",
+            started_at,
+        )
 
     except Exception as exc:
         logger.error("Error processing Zendesk webhook: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+        return _timed_json_response({"error": str(exc)}, 500, "/zendesk/webhook", started_at)
 
 
 @flask_app.route("/health", methods=["GET"])
