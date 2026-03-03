@@ -232,16 +232,53 @@ def _diagnostics_worker() -> None:
         "Diagnostics worker started interval_seconds=%s",
         Config.DIAGNOSTICS_LOG_INTERVAL_SECONDS,
     )
+    prev_connections_ms = None
+
     while True:
         time.sleep(Config.DIAGNOSTICS_LOG_INTERVAL_SECONDS)
         worker_alive = _slack_worker_thread.is_alive() if _slack_worker_thread else False
+        pool_stats = thread_store.get_pool_stats()
         logger.info(
             "Runtime diagnostics queue_depth=%s worker_alive=%s db_pool_stats=%s durable_job_stats=%s",
             _queue_depth(),
             worker_alive,
-            thread_store.get_pool_stats(),
+            pool_stats,
             thread_store.get_durable_job_stats(),
         )
+
+        # Proactive zombie pool detection: if the pool has connections but
+        # none are available, requests are waiting, and the lifetime
+        # connections_ms counter hasn't budged since the last cycle, the
+        # pool's internal worker threads are likely dead.
+        try:
+            pool_size = pool_stats.get("pool_size", 0)
+            pool_available = pool_stats.get("pool_available", 0)
+            requests_waiting = pool_stats.get("requests_waiting", 0)
+            connections_ms = pool_stats.get("connections_ms", 0)
+
+            is_zombie = (
+                pool_size > 0
+                and pool_available == 0
+                and requests_waiting > 0
+                and prev_connections_ms is not None
+                and connections_ms == prev_connections_ms
+                and connections_ms > 0
+            )
+
+            if is_zombie:
+                logger.warning(
+                    "ZOMBIE POOL DETECTED by diagnostics: pool_size=%s pool_available=%s "
+                    "requests_waiting=%s connections_ms=%s (unchanged). Triggering reset.",
+                    pool_size,
+                    pool_available,
+                    requests_waiting,
+                    connections_ms,
+                )
+                thread_store._reset_pool()
+
+            prev_connections_ms = connections_ms
+        except Exception as exc:
+            logger.error("Error in zombie pool detection: %s", exc)
 
 
 def _cleanup_worker() -> None:

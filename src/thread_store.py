@@ -61,6 +61,19 @@ class ThreadMappingStore:
     _shared_pool = None
     _pool_lock = threading.Lock()
     _db_initialized = False
+    _pool_needs_reset = False
+    _pool_consecutive_timeouts = 0
+    _POOL_RESET_THRESHOLD = 3
+
+    @staticmethod
+    def _on_reconnect_failed(pool):
+        """Called by psycopg_pool when reconnection attempts exhaust reconnect_timeout."""
+        logger.error(
+            "CONNECTION POOL RECONNECT FAILED: pool internal reconnection exhausted. "
+            "pool_stats=%s. Pool will be reset on next connection attempt.",
+            pool.get_stats(),
+        )
+        ThreadMappingStore._pool_needs_reset = True
 
     @staticmethod
     def _get_int_env(var_name: str, default: int, min_value: int = 1) -> int:
@@ -95,11 +108,11 @@ class ThreadMappingStore:
     def __init__(self):
         """
         Initialize the thread mapping store with PostgreSQL backend.
-        
+
         Reads DATABASE_URL from environment variables.
         """
         self.database_url = os.getenv("DATABASE_URL")
-        
+
         if not self.database_url:
             raise ValueError("DATABASE_URL environment variable is required")
 
@@ -111,69 +124,129 @@ class ThreadMappingStore:
         self.db_statement_timeout_ms = self._get_int_env("DB_STATEMENT_TIMEOUT_MS", 15000, min_value=1000)
         self.db_pool_max_idle = self._get_int_env("DB_POOL_MAX_IDLE_SECONDS", 120, min_value=1)
         self.db_pool_max_lifetime = self._get_int_env("DB_POOL_MAX_LIFETIME_SECONDS", 900, min_value=30)
-        
+        self.db_pool_reconnect_timeout = self._get_float_env("DB_POOL_RECONNECT_TIMEOUT", 60.0, min_value=5.0)
+
         # Create one shared pool per process to avoid unnecessary connection growth.
         with ThreadMappingStore._pool_lock:
             if ThreadMappingStore._shared_pool is None:
-                # Configured for hosted PostgreSQL with conservative defaults.
                 try:
-                    ThreadMappingStore._shared_pool = ConnectionPool(
-                        self.database_url,
-                        min_size=self.pool_min_size,
-                        max_size=self.pool_max_size,
-                        timeout=self.pool_acquire_timeout,
-                        kwargs={
-                            "autocommit": True,
-                            "prepare_threshold": None,  # Disable prepared statements
-                            "connect_timeout": self.db_connect_timeout,
-                            "options": f"-c statement_timeout={self.db_statement_timeout_ms}"
-                        },
-                        check=ConnectionPool.check_connection,  # Health check for connections
-                        max_idle=self.db_pool_max_idle,
-                        max_lifetime=self.db_pool_max_lifetime
-                    )
+                    ThreadMappingStore._shared_pool = self._create_pool()
                     logger.info(
                         "PostgreSQL connection pool created: min=%s max=%s acquire_timeout=%.2fs "
-                        "connect_timeout=%ss statement_timeout_ms=%s max_idle=%ss max_lifetime=%ss",
+                        "connect_timeout=%ss statement_timeout_ms=%s max_idle=%ss max_lifetime=%ss "
+                        "reconnect_timeout=%.1fs",
                         self.pool_min_size,
                         self.pool_max_size,
                         self.pool_acquire_timeout,
                         self.db_connect_timeout,
                         self.db_statement_timeout_ms,
                         self.db_pool_max_idle,
-                        self.db_pool_max_lifetime
+                        self.db_pool_max_lifetime,
+                        self.db_pool_reconnect_timeout,
                     )
                 except Exception as e:
                     logger.error(f"Failed to create connection pool: {e}")
                     raise
-            
+
             self.connection_pool = ThreadMappingStore._shared_pool
-            
+
             # Initialize database tables once per process.
             if not ThreadMappingStore._db_initialized:
                 self._init_db()
                 ThreadMappingStore._db_initialized = True
-        
+
         logger.info("ThreadMappingStore initialized with PostgreSQL")
+
+    def _create_pool(self) -> ConnectionPool:
+        """Create a new ConnectionPool instance with current configuration."""
+        return ConnectionPool(
+            self.database_url,
+            min_size=self.pool_min_size,
+            max_size=self.pool_max_size,
+            timeout=self.pool_acquire_timeout,
+            reconnect_timeout=self.db_pool_reconnect_timeout,
+            reconnect_failed=ThreadMappingStore._on_reconnect_failed,
+            num_workers=3,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": None,
+                "connect_timeout": self.db_connect_timeout,
+                "options": f"-c statement_timeout={self.db_statement_timeout_ms}"
+            },
+            check=ConnectionPool.check_connection,
+            max_idle=self.db_pool_max_idle,
+            max_lifetime=self.db_pool_max_lifetime,
+        )
     
     @contextmanager
     def _get_connection(self):
-        """Get a connection from the pool with timeout diagnostics."""
+        """Get a connection from the pool with zombie detection and auto-recovery."""
+        if ThreadMappingStore._pool_needs_reset:
+            logger.warning("Pool reset flag detected in _get_connection, resetting pool")
+            self._reset_pool()
+
+        # If another thread already reset the pool, pick up the new reference.
+        current_pool = ThreadMappingStore._shared_pool
+        if current_pool is not None and current_pool is not self.connection_pool:
+            self.connection_pool = current_pool
+
         try:
             with self.connection_pool.connection() as conn:
+                ThreadMappingStore._pool_consecutive_timeouts = 0
                 yield conn
         except PoolTimeout as e:
+            ThreadMappingStore._pool_consecutive_timeouts += 1
             logger.error(
-                "DB pool acquisition timeout after %.2fs while acquiring connection. pool_stats=%s error=%s",
+                "DB pool acquisition timeout after %.2fs while acquiring connection "
+                "(consecutive_timeouts=%s/%s). pool_stats=%s error=%s",
                 self.pool_acquire_timeout,
+                ThreadMappingStore._pool_consecutive_timeouts,
+                ThreadMappingStore._POOL_RESET_THRESHOLD,
                 self.get_pool_stats(),
-                e
+                e,
             )
+            if ThreadMappingStore._pool_consecutive_timeouts >= ThreadMappingStore._POOL_RESET_THRESHOLD:
+                logger.warning(
+                    "ZOMBIE POOL DETECTED: %s consecutive timeouts. Triggering pool reset.",
+                    ThreadMappingStore._pool_consecutive_timeouts,
+                )
+                self._reset_pool()
             raise
 
-    def _return_connection(self, conn):
-        """Return a connection to the pool (handled by context manager in psycopg3)."""
-        pass  # psycopg3 uses context managers, no manual return needed
+    def _reset_pool(self):
+        """Destroy the current pool and create a fresh one.
+
+        Called when the pool enters an unrecoverable zombie state where
+        internal worker threads have stopped creating connections.
+        """
+        with ThreadMappingStore._pool_lock:
+            old_pool = ThreadMappingStore._shared_pool
+            if old_pool is None:
+                logger.warning("Pool reset requested but no pool exists")
+                return
+
+            logger.warning(
+                "POOL RESET: destroying zombie pool and creating fresh instance. "
+                "old_pool_stats=%s",
+                old_pool.get_stats(),
+            )
+
+            try:
+                old_pool.close(timeout=2.0)
+            except Exception as exc:
+                logger.error("Error closing old pool during reset: %s", exc)
+
+            ThreadMappingStore._shared_pool = None
+            ThreadMappingStore._pool_needs_reset = False
+            ThreadMappingStore._pool_consecutive_timeouts = 0
+
+            try:
+                ThreadMappingStore._shared_pool = self._create_pool()
+                self.connection_pool = ThreadMappingStore._shared_pool
+                logger.warning("POOL RESET: new pool created successfully")
+            except Exception as exc:
+                logger.error("POOL RESET FAILED: could not create new pool: %s", exc)
+                raise
 
     def get_pool_stats(self) -> dict:
         """Get connection pool stats for diagnostics."""
