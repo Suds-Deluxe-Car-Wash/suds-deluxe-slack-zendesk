@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+from urllib.parse import parse_qs
 from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request
@@ -355,6 +356,7 @@ def slack_events():
     started_at = time.time()
     retry_num = request.headers.get("X-Slack-Retry-Num")
     retry_reason = request.headers.get("X-Slack-Retry-Reason")
+    raw_body = request.get_data(cache=True, as_text=True)
     logger.info("Request started route=/slack/events content_type=%s", request.content_type)
 
     if retry_num or retry_reason:
@@ -365,7 +367,8 @@ def slack_events():
             _queue_depth(),
         )
 
-    if request.form.get("payload"):
+    parsed_form = parse_qs(raw_body, keep_blank_values=True) if raw_body else {}
+    if "payload" in parsed_form:
         logger.info("Delegating Slack interactive payload to Bolt route=/slack/events")
         response = handler.handle(request)
         duration_ms = round((time.time() - started_at) * 1000, 2)
@@ -376,7 +379,6 @@ def slack_events():
         )
         return response
 
-    raw_body = request.get_data(cache=True, as_text=True)
     if not _verify_slack_signature(raw_body):
         logger.warning("Rejected Slack request due to invalid signature route=/slack/events")
         return _timed_json_response({"error": "Invalid signature"}, 401, "/slack/events", started_at)
