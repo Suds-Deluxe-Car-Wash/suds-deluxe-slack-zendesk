@@ -27,15 +27,22 @@ from src.zendesk_webhook_handler import ZendeskWebhookHandler
 # to stdout. Python 3.13's BufferedWriter is not reentrant-safe; putting a
 # QueueListener between the root logger and StreamHandler serialises all
 # writes and eliminates the "reentrant call inside <_io.BufferedWriter>" crash.
+#
+# Important: do NOT use basicConfig() here. basicConfig() sets BASIC_FORMAT
+# ("%(levelname)s:%(name)s:%(message)s") on the QueueHandler when no format=
+# kwarg is given. Python 3.13's QueueHandler.prepare() calls self.format() and
+# sets record.msg to the result, so the StreamHandler would see a pre-formatted
+# message and produce double-prefixed output. Configuring the root logger
+# directly leaves the QueueHandler with no formatter, so prepare() uses the
+# default "%(message)s" style and record.msg stays the plain original message.
 _log_queue = queue.SimpleQueue()
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(
     logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 )
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
-    handlers=[logging.handlers.QueueHandler(_log_queue)],
-)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(getattr(logging, Config.LOG_LEVEL))
+_root_logger.addHandler(logging.handlers.QueueHandler(_log_queue))
 _log_listener = logging.handlers.QueueListener(
     _log_queue, _stream_handler, respect_handler_level=True
 )
