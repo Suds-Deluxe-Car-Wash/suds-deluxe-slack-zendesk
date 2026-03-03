@@ -1,8 +1,10 @@
 """Handle Zendesk webhook events and sync to Slack."""
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+
 from src.config import Config
 from src.thread_store import ThreadMappingStore
 
@@ -11,94 +13,111 @@ logger = logging.getLogger(__name__)
 
 class ZendeskWebhookHandler:
     """Handles Zendesk webhook events and posts updates to Slack."""
-    
+
     def __init__(self, thread_store: Optional[ThreadMappingStore] = None):
         """Initialize Slack client and thread store."""
         self.client = WebClient(token=Config.SLACK_BOT_TOKEN)
         self.thread_store = thread_store or ThreadMappingStore()
         logger.info("ZendeskWebhookHandler initialized")
-    
-    def handle_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process Zendesk webhook payload and post updates to Slack.
-        
-        Args:
-            payload: Zendesk webhook payload
-            
-        Returns:
-            Response dictionary with success status
-        """
+
+    def handle_webhook(
+        self,
+        payload: Dict[str, Any],
+        invocation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Process a Zendesk webhook payload and post updates to Slack."""
         try:
-            # Extract ticket ID from webhook
             ticket_id = self._extract_ticket_id(payload)
             if not ticket_id:
-                logger.warning("No ticket ID found in webhook payload")
+                logger.warning(
+                    "No ticket ID found in webhook payload zendesk_invocation_id=%s",
+                    invocation_id,
+                )
                 return {"success": False, "error": "No ticket ID"}
 
-            # Parse first: many Zendesk triggers carry no comment to sync to Slack.
             messages = self._parse_webhook_event(payload)
             if not messages:
-                logger.debug(f"No messages to post for ticket #{ticket_id}")
+                logger.debug(
+                    "No messages to post for ticket #%s zendesk_invocation_id=%s",
+                    ticket_id,
+                    invocation_id,
+                )
                 return {"success": True, "skipped": True}
-            
-            # Get Slack thread info for this ticket
+
             thread_info = self.thread_store.get_thread_info(ticket_id)
             if not thread_info:
-                logger.info(f"No Slack thread found for ticket #{ticket_id} - skipping")
+                logger.info(
+                    "No Slack thread found for ticket #%s zendesk_invocation_id=%s - skipping",
+                    ticket_id,
+                    invocation_id,
+                )
                 return {"success": True, "skipped": True}
-            
-            # Post each message to Slack thread
+
+            failed_posts = 0
             for message in messages:
-                self._post_to_slack_thread(
+                success = self._post_to_slack_thread(
                     channel_id=thread_info["channel_id"],
                     thread_ts=thread_info["thread_ts"],
-                    message=message
+                    message=message,
                 )
-            
-            logger.info(f"Posted {len(messages)} update(s) to Slack for ticket #{ticket_id}")
+                if not success:
+                    failed_posts += 1
+
+            if failed_posts:
+                logger.error(
+                    "Failed to post %s of %s Slack update(s) for ticket #%s zendesk_invocation_id=%s",
+                    failed_posts,
+                    len(messages),
+                    ticket_id,
+                    invocation_id,
+                )
+                return {"success": False, "error": "Failed to post one or more Slack thread updates"}
+
+            logger.info(
+                "Posted %s update(s) to Slack for ticket #%s zendesk_invocation_id=%s",
+                len(messages),
+                ticket_id,
+                invocation_id,
+            )
             return {"success": True, "messages_posted": len(messages)}
-            
-        except Exception as e:
-            logger.error(f"Error handling Zendesk webhook: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
+
+        except Exception as exc:
+            logger.error("Error handling Zendesk webhook: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
     def _extract_ticket_id(self, payload: Dict[str, Any]) -> Optional[int]:
         """Extract ticket ID from Zendesk webhook payload."""
-        # Zendesk sends ticket ID in different places depending on trigger type
         ticket_id = payload.get("ticket_id")
         if ticket_id:
             return int(ticket_id)
-        
-        # Check in ticket object
+
         ticket = payload.get("ticket", {})
         if ticket and ticket.get("id"):
             return int(ticket["id"])
-        
-        return None
-    
-    def _parse_webhook_event(self, payload: Dict[str, Any]) -> list:
-        """
-        Parse Zendesk webhook event and extract relevant updates.
-        
-        Args:
-            payload: Zendesk webhook payload
-            
-        Returns:
-            List of formatted message strings to post to Slack
-        """
-        messages: List[str] = []
 
-        def _format_attachments(attachments):
-            formatted = []
-            for a in attachments or []:
-                name = a.get("file_name") or a.get("name") or a.get("filename") or "attachment"
+        return None
+
+    def _parse_webhook_event(self, payload: Dict[str, Any]) -> List[str]:
+        """Parse Zendesk webhook events into Slack message strings."""
+        messages: List[str] = []
+        seen_messages = set()
+
+        def _format_attachments(attachments: Any) -> List[str]:
+            formatted: List[str] = []
+            for attachment in attachments or []:
+                name = (
+                    attachment.get("file_name")
+                    or attachment.get("name")
+                    or attachment.get("filename")
+                    or "attachment"
+                )
                 url = (
-                    a.get("content_url")
-                    or a.get("content_url_https")
-                    or a.get("content_url_http")
-                    or a.get("url")
-                    or a.get("attachment_url")
-                    or a.get("public_url")
+                    attachment.get("content_url")
+                    or attachment.get("content_url_https")
+                    or attachment.get("content_url_http")
+                    or attachment.get("url")
+                    or attachment.get("attachment_url")
+                    or attachment.get("public_url")
                 )
                 if url:
                     formatted.append(f"<{url}|{name}>")
@@ -106,9 +125,10 @@ class ZendeskWebhookHandler:
                     formatted.append(name)
             return formatted
 
-        def _process_comment_obj(comment_obj):
+        def _process_comment_obj(comment_obj: Optional[Dict[str, Any]]) -> None:
             if not comment_obj:
                 return
+
             author_name = comment_obj.get("author_name", "") or comment_obj.get("author", {}).get("name", "")
             if author_name == "Slack Automation":
                 logger.debug("Skipping comment from Slack Automation (loop prevention)")
@@ -129,27 +149,40 @@ class ZendeskWebhookHandler:
 
             is_public = comment_obj.get("public", True)
             attachments = comment_obj.get("attachments") or comment_obj.get("uploads") or []
-
             attach_links = _format_attachments(attachments)
+            author_display = (
+                author_name
+                or (
+                    comment_obj.get("author", {}).get("name")
+                    if isinstance(comment_obj.get("author"), dict)
+                    else ""
+                )
+                or "Unknown"
+            )
 
-            if body:
-                if is_public:
-                    author_email = comment_obj.get("author_email", "") or (comment_obj.get("author", {}).get("email") if isinstance(comment_obj.get("author"), dict) else "")
-                    author_display = author_name or (comment_obj.get("author", {}).get("name") if isinstance(comment_obj.get("author"), dict) else author_name) or "Unknown"
-                    if author_email:
-                        prefix = f"💬 {author_display} ({author_email}) replied:\n"
-                    else:
-                        prefix = f"💬 {author_display} replied:\n"
-                    msg = f"{prefix}{body}"
-                    if attach_links:
-                        msg += "\n\nAttachments:\n" + "\n".join(f"- {l}" for l in attach_links)
-                    messages.append(msg)
+            if not body:
+                return
+
+            if is_public:
+                author_email = comment_obj.get("author_email", "") or (
+                    comment_obj.get("author", {}).get("email")
+                    if isinstance(comment_obj.get("author"), dict)
+                    else ""
+                )
+                if author_email:
+                    prefix = f"Comment from {author_display} ({author_email}):\n"
                 else:
-                    prefix = f"🔒 Internal note from {author_display}:\n"
-                    msg = f"{prefix}{body}"
-                    if attach_links:
-                        msg += "\n\nAttachments:\n" + "\n".join(f"- {l}" for l in attach_links)
-                    messages.append(msg)
+                    prefix = f"Comment from {author_display}:\n"
+            else:
+                prefix = f"Internal note from {author_display}:\n"
+
+            message = f"{prefix}{body}"
+            if attach_links:
+                message += "\n\nAttachments:\n" + "\n".join(f"- {link}" for link in attach_links)
+            if message in seen_messages:
+                return
+            seen_messages.add(message)
+            messages.append(message)
 
         current_comment = payload.get("current_comment") or payload.get("comment")
         if current_comment:
@@ -157,47 +190,28 @@ class ZendeskWebhookHandler:
 
         audit = payload.get("audit") or payload.get("audits") or payload.get("event") or payload.get("ticket_audit")
         if audit:
-            events = []
+            events: List[Dict[str, Any]] = []
             if isinstance(audit, dict):
                 events = audit.get("events", [])
             elif isinstance(audit, list):
-                for a in audit:
-                    if isinstance(a, dict):
-                        events.extend(a.get("events", []) or [])
-            for ev in events:
-                ev_type = ev.get("type", "").lower()
-                if ev_type == "comment":
-                    comment_obj = ev.get("comment") or ev
-                    _process_comment_obj(comment_obj)
+                for audit_item in audit:
+                    if isinstance(audit_item, dict):
+                        events.extend(audit_item.get("events", []) or [])
+            for event in events:
+                if event.get("type", "").lower() == "comment":
+                    _process_comment_obj(event.get("comment") or event)
 
         ticket = payload.get("ticket") or {}
-        if ticket and isinstance(ticket, dict):
-            t_comment = ticket.get("comment")
-            if t_comment:
-                _process_comment_obj(t_comment)
+        if isinstance(ticket, dict) and ticket.get("comment"):
+            _process_comment_obj(ticket.get("comment"))
 
         return messages
-    
+
     def _post_to_slack_thread(self, channel_id: str, thread_ts: str, message: str) -> bool:
-        """
-        Post a message to a Slack thread.
-        
-        Args:
-            channel_id: Slack channel ID
-            thread_ts: Thread timestamp
-            message: Message text to post
-            
-        Returns:
-            True if successful, False otherwise
-        """
+        """Post a message to a Slack thread."""
         try:
-            self.client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=message
-            )
+            self.client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=message)
             return True
-            
-        except SlackApiError as e:
-            logger.error(f"Failed to post to Slack thread: {e}")
+        except SlackApiError as exc:
+            logger.error("Failed to post to Slack thread: %s", exc)
             return False

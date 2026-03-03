@@ -25,6 +25,127 @@ class SlackHandler:
         # across the single SlackHandler instance created in `app.py`.
         self.db_semaphore = threading.BoundedSemaphore(Config.DB_MAX_CONCURRENT_REQUESTS)
         logger.info("Slack client initialized successfully")
+
+    @staticmethod
+    def get_user_friendly_error(error_message: str) -> str:
+        """Convert technical error messages to user-friendly ones."""
+        error_lower = (error_message or "").lower()
+
+        if "connection" in error_lower or "reset by peer" in error_lower or "timeout" in error_lower:
+            return "The ticket system is temporarily busy. Please try again in a moment."
+
+        if "not allowed" in error_lower or "channel" in error_lower:
+            return "Tickets cannot be created from this channel."
+
+        if "parse" in error_lower or "workflow" in error_lower:
+            return "Could not read the message format. Please use the workflow form."
+
+        if "zendesk" in error_lower or "api" in error_lower:
+            return "Unable to connect to the ticketing system. Please try again."
+
+        return "Failed to create ticket. Please try again."
+
+    def process_message_event_job(self, job: Dict[str, Any]) -> None:
+        """Process a queued Slack message event serially."""
+        event = job["event"]
+        slack_event_id = job.get("slack_event_id")
+        event_kind = job.get("event_kind")
+        dedupe_key = f"slack:{slack_event_id}" if slack_event_id else None
+
+        if dedupe_key:
+            processed = self.thread_store.is_event_processed(dedupe_key)
+            if processed.status == "processed":
+                logger.info("Skipping duplicate Slack delivery slack_event_id=%s", slack_event_id)
+                return
+            if processed.status == "db_error":
+                logger.error(
+                    "Unable to check Slack event dedupe state slack_event_id=%s error=%s",
+                    slack_event_id,
+                    processed.error,
+                )
+                return
+
+        success = False
+
+        if event_kind == "thread_reply":
+            result = self.add_thread_reply_to_ticket(event)
+            success = result.get("success", False)
+            if not success:
+                logger.warning(
+                    "Thread reply processing incomplete slack_event_id=%s thread_ts=%s status=%s",
+                    slack_event_id,
+                    event.get("thread_ts"),
+                    result.get("status"),
+                )
+        elif event_kind == "workflow_message":
+            result = self.handle_workflow_message(
+                message=event,
+                channel_id=event.get("channel"),
+                user_id=event.get("user")
+            )
+            success = result.get("success", False)
+            if result.get("duplicate_prevented") and result.get("reason") == "creation_in_progress":
+                success = False
+            if success:
+                if result.get("duplicate_prevented"):
+                    logger.info(
+                        "Workflow message resolved without duplicate ticket slack_event_id=%s message_ts=%s reason=%s",
+                        slack_event_id,
+                        event.get("ts"),
+                        result.get("reason", "duplicate"),
+                    )
+                else:
+                    logger.info(
+                        "Workflow message created ticket slack_event_id=%s message_ts=%s ticket_id=%s",
+                        slack_event_id,
+                        event.get("ts"),
+                        result.get("ticket_id"),
+                    )
+            else:
+                logger.error(
+                    "Workflow message processing failed slack_event_id=%s message_ts=%s error=%s",
+                    slack_event_id,
+                    event.get("ts"),
+                    result.get("error"),
+                )
+        else:
+            logger.warning("Unknown Slack event job kind=%s slack_event_id=%s", event_kind, slack_event_id)
+
+        if success and dedupe_key and not self.thread_store.mark_event_processed(dedupe_key):
+            logger.error("Failed to mark Slack event processed slack_event_id=%s", slack_event_id)
+
+    def process_shortcut_job(self, job: Dict[str, Any]) -> None:
+        """Process a queued shortcut and notify the requesting user."""
+        payload = job["shortcut"]
+        channel_id = payload.get("channel", {}).get("id")
+        user_id = payload.get("user", {}).get("id")
+        result = self.handle_message_shortcut(payload)
+
+        if not channel_id or not user_id:
+            logger.warning("Shortcut job missing user/channel context")
+            return
+
+        if result.get("success"):
+            if result.get("duplicate_prevented"):
+                if "ticket_id" in result:
+                    text = (
+                        f"Ticket #{result['ticket_id']} already exists for this message. "
+                        "Check the thread for details."
+                    )
+                else:
+                    text = "A ticket is already being created for this message. Please check the thread shortly."
+            else:
+                text = f"Zendesk ticket #{result['ticket_id']} created successfully. Check the thread for details."
+        else:
+            text = (
+                f"{self.get_user_friendly_error(result.get('error', 'Unknown error occurred'))}\n\n"
+                "_If this continues, please contact support._"
+            )
+
+        try:
+            self.client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
+        except SlackApiError as e:
+            logger.error("Failed to post shortcut status message: %s", e.response["error"])
     
     def handle_workflow_message(self, message: Dict[str, Any], channel_id: str, user_id: str = None) -> Dict[str, Any]:
         """
@@ -57,27 +178,57 @@ class SlackHandler:
             # ATOMIC CLAIM: Reserve this thread BEFORE doing anything else
             # This prevents race conditions where multiple requests create tickets simultaneously
             if message_ts:
-                claimed = self.thread_store.claim_thread(message_ts, channel_id)
-                if not claimed:
+                claim_result = self.thread_store.claim_thread(message_ts, channel_id)
+                if claim_result.status == "db_error":
+                    return {
+                        "success": False,
+                        "error": f"Failed to claim thread for ticket creation: {claim_result.error or 'database error'}"
+                    }
+
+                if claim_result.status == "duplicate":
                     # Another request already claimed this thread
                     # Get the existing ticket (may still be placeholder -1 if other request is in progress)
-                    existing_ticket_id = self.thread_store.get_ticket_id(message_ts)
-                    if existing_ticket_id and existing_ticket_id != -1:
-                        logger.info(f"Ticket #{existing_ticket_id} already exists for message {message_ts}, preventing duplicate")
+                    existing_ticket = self.thread_store.get_ticket_id(message_ts)
+                    if existing_ticket.status == "db_error":
+                        return {
+                            "success": False,
+                            "error": (
+                                "Failed to inspect existing ticket mapping after duplicate claim: "
+                                f"{existing_ticket.error or 'database error'}"
+                            )
+                        }
+
+                    if existing_ticket.status == "found" and existing_ticket.ticket_id:
+                        logger.info(
+                            "Ticket #%s already exists for message %s, preventing duplicate",
+                            existing_ticket.ticket_id,
+                            message_ts,
+                        )
                         return {
                             "success": True,
-                            "ticket_id": existing_ticket_id,
-                            "ticket_url": f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{existing_ticket_id}",
-                            "duplicate_prevented": True
+                            "ticket_id": existing_ticket.ticket_id,
+                            "ticket_url": (
+                                f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/"
+                                f"{existing_ticket.ticket_id}"
+                            ),
+                            "duplicate_prevented": True,
+                            "reason": "ticket_exists",
                         }
-                    else:
+
+                    if existing_ticket.status == "placeholder":
                         # Placeholder exists, another request is creating the ticket right now
-                        logger.info(f"Another request is creating ticket for message {message_ts}, preventing duplicate")
+                        logger.info("Ticket creation already in progress for message %s", message_ts)
                         return {
                             "success": True,
                             "duplicate_prevented": True,
-                            "message": "Ticket creation in progress by another request"
+                            "message": "Ticket creation in progress by another request",
+                            "reason": "creation_in_progress",
                         }
+
+                    return {
+                        "success": False,
+                        "error": "Thread was already claimed but no finished ticket mapping was found."
+                    }
 
             # Validate channel is allowed
             if not is_channel_allowed(channel_id):
@@ -295,13 +446,6 @@ class SlackHandler:
             Dictionary with parsed message data or None if parsing fails
         """
         try:
-            # TEMPORARY DEBUG - Remove after fixing field mapping
-            import json
-            logger.info("=" * 80)
-            logger.info("RAW SLACK MESSAGE:")
-            logger.info(json.dumps(message, indent=2))
-            logger.info("=" * 80)
-            
             parsed_data = {
                 "message_link": self._build_message_link(channel_id, message.get("ts")),
                 "reporter_name": self._get_user_name(message.get("user")),
@@ -325,14 +469,14 @@ class SlackHandler:
             logger.error(f"Error parsing workflow message: {e}", exc_info=True)
             return None
     
-    def add_thread_reply_to_ticket(self, message_event: Dict[str, Any]) -> bool:
+    def add_thread_reply_to_ticket(self, message_event: Dict[str, Any]) -> Dict[str, Any]:
         """Add a Slack thread reply as an internal note to the corresponding Zendesk ticket.
         
         Args:
             message_event: Slack message event from a thread reply
             
         Returns:
-            True if comment added successfully, False otherwise
+            Result dictionary with explicit status.
         """
         try:
             thread_ts = message_event.get("thread_ts")
@@ -342,11 +486,22 @@ class SlackHandler:
             attachments = message_event.get("attachments", []) or []
             
             # Get ticket ID from thread mapping
-            ticket_id = self.thread_store.get_ticket_id(thread_ts)
-            # ``get_ticket_id`` returns None when thread is unclaimed or still has the -1 placeholder
-            if ticket_id is None:
+            ticket_lookup = self.thread_store.get_ticket_id(thread_ts)
+            if ticket_lookup.status == "db_error":
+                logger.error(
+                    "Failed to resolve ticket for thread reply thread_ts=%s error=%s",
+                    thread_ts,
+                    ticket_lookup.error,
+                )
+                return {"success": False, "status": "db_error", "error": ticket_lookup.error}
+            if ticket_lookup.status == "placeholder":
+                logger.warning("Thread %s is still waiting on ticket creation placeholder", thread_ts)
+                return {"success": False, "status": "placeholder"}
+            if ticket_lookup.status == "not_found" or not ticket_lookup.ticket_id:
                 logger.warning(f"No ticket found for thread {thread_ts}")
-                return False
+                return {"success": False, "status": "not_found"}
+
+            ticket_id = ticket_lookup.ticket_id
             
             # Get user's display name
             user_name = self._get_user_name(user_id)
@@ -387,12 +542,12 @@ class SlackHandler:
             
             if success:
                 logger.info(f"Added thread reply to ticket #{ticket_id} from user {user_name}")
-            
-            return success
+
+            return {"success": success, "status": "success" if success else "zendesk_error", "ticket_id": ticket_id}
             
         except Exception as e:
             logger.error(f"Failed to add thread reply to ticket: {e}")
-            return False
+            return {"success": False, "status": "exception", "error": str(e)}
     
     def _determine_group(self, parsed_data: Dict[str, Any], form_config: Dict[str, Any]) -> Optional[int]:
         """Determine Zendesk group ID based on field values.

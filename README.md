@@ -94,9 +94,19 @@ ZENDESK_SUBDOMAIN=yourcompany
 ZENDESK_EMAIL=admin@yourcompany.com
 ZENDESK_API_TOKEN=your-api-token
 ZENDESK_AUTOMATION_EMAIL=slack-automation@yourcompany.com
+ZENDESK_WEBHOOK_SIGNING_SECRET=your-zendesk-webhook-signing-secret
 
 # PostgreSQL Database
 DATABASE_URL=postgresql://postgres.xxxxx:[PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+DB_POOL_MIN_SIZE=1
+DB_POOL_MAX_SIZE=2
+DB_POOL_ACQUIRE_TIMEOUT=5
+DB_CONNECT_TIMEOUT=5
+DB_STATEMENT_TIMEOUT_MS=15000
+DB_MAX_CONCURRENT_REQUESTS=1
+DB_SEMAPHORE_ACQUIRE_TIMEOUT=1
+SLACK_EVENT_QUEUE_SIZE=100
+DIAGNOSTICS_LOG_INTERVAL_SECONDS=60
 
 # Server Configuration
 PORT=3000
@@ -146,6 +156,11 @@ Install to workspace and copy the **Bot User OAuth Token**
 5. **Triggers**: Create trigger for ticket updates
    - Conditions: Ticket → Is updated
    - Actions: Notify webhook → Select your webhook
+
+Recommended trigger narrowing:
+- Only send comment-bearing updates to the webhook
+- Exclude comments containing `[Posted from Slack]`
+- Exclude the Slack automation user when possible
 
 ### 6. Configure Channel and Form Mappings
 
@@ -199,7 +214,7 @@ Get Zendesk Field IDs: Admin → Objects and rules → Tickets → Forms → Edi
 2. New Web Service → Connect your GitHub repo
 3. Configure:
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `gunicorn -b 0.0.0.0:$PORT src.app:flask_app`
+   - **Start Command**: `gunicorn --workers 1 --threads 4 -b 0.0.0.0:$PORT src.app:flask_app`
 4. Add environment variables from `.env`
 5. Deploy!
 
@@ -209,6 +224,8 @@ Render free tier sleeps after 15 minutes. Use cron-job.org:
 1. Go to [cron-job.org](https://cron-job.org)
 2. Create cron job: `https://your-app.onrender.com/health`
 3. Schedule: Every 10 minutes
+
+For incident review, use `https://your-app.onrender.com/diagnostics` to inspect queue depth and DB pool stats.
 
 ### Render Log Alerts to Slack
 
@@ -284,7 +301,7 @@ Thread replies include a `[Posted from Slack]` signature. When Zendesk webhooks 
 
 ### Automatic Cleanup
 
-Thread mappings older than 30 days are automatically deleted to prevent database bloat. This runs on every ticket creation.
+Thread mappings older than 30 days are automatically deleted to prevent database bloat. This runs in a monthly background task.
 
 ## Troubleshooting
 
@@ -357,7 +374,7 @@ python run.py
 ## Limitations
 
 - Free tier sleeps after 15 minutes (mitigated with keepalive)
-- PostgreSQL connection pool: 1-10 connections
+- PostgreSQL connection pool: defaults to 1-2 direct connections
 - Slack rate limits: 1 request/second per method
 - Zendesk rate limits: 700 requests/minute
 

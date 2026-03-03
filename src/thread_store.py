@@ -3,13 +3,32 @@ import os
 import logging
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
-import psycopg
+from typing import Optional, Literal
 from psycopg_pool import ConnectionPool
 from psycopg_pool import PoolTimeout
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ClaimThreadResult:
+    status: Literal["claimed", "duplicate", "db_error"]
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TicketLookupResult:
+    status: Literal["found", "not_found", "placeholder", "db_error"]
+    ticket_id: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class EventProcessedResult:
+    status: Literal["processed", "not_processed", "db_error"]
+    error: Optional[str] = None
 
 
 class ThreadMappingStore:
@@ -60,9 +79,9 @@ class ThreadMappingStore:
             raise ValueError("DATABASE_URL environment variable is required")
 
         # Render-friendly defaults; override via env when needed.
-        self.pool_min_size = self._get_int_env("DB_POOL_MIN_SIZE", 2, min_value=1)
-        self.pool_max_size = self._get_int_env("DB_POOL_MAX_SIZE", 5, min_value=self.pool_min_size)
-        self.pool_acquire_timeout = self._get_float_env("DB_POOL_ACQUIRE_TIMEOUT", 8.0, min_value=0.1)
+        self.pool_min_size = self._get_int_env("DB_POOL_MIN_SIZE", 1, min_value=1)
+        self.pool_max_size = self._get_int_env("DB_POOL_MAX_SIZE", 2, min_value=self.pool_min_size)
+        self.pool_acquire_timeout = self._get_float_env("DB_POOL_ACQUIRE_TIMEOUT", 5.0, min_value=0.1)
         self.db_connect_timeout = self._get_int_env("DB_CONNECT_TIMEOUT", 5, min_value=1)
         self.db_statement_timeout_ms = self._get_int_env("DB_STATEMENT_TIMEOUT_MS", 15000, min_value=1000)
         self.db_pool_max_idle = self._get_int_env("DB_POOL_MAX_IDLE_SECONDS", 120, min_value=1)
@@ -114,28 +133,24 @@ class ThreadMappingStore:
     
     @contextmanager
     def _get_connection(self):
-        """Get a connection from the pool with timeout diagnostics. Logs pool stats before and after."""
-        logger.info(f"[POOL] Before acquiring connection: {self._get_pool_stats()}")
+        """Get a connection from the pool with timeout diagnostics."""
         try:
             with self.connection_pool.connection() as conn:
-                logger.info(f"[POOL] Connection acquired: {self._get_pool_stats()}")
                 yield conn
         except PoolTimeout as e:
             logger.error(
                 "DB pool acquisition timeout after %.2fs while acquiring connection. pool_stats=%s error=%s",
                 self.pool_acquire_timeout,
-                self._get_pool_stats(),
+                self.get_pool_stats(),
                 e
             )
             raise
-        finally:
-            logger.info(f"[POOL] After releasing connection: {self._get_pool_stats()}")
-    
+
     def _return_connection(self, conn):
         """Return a connection to the pool (handled by context manager in psycopg3)."""
         pass  # psycopg3 uses context managers, no manual return needed
 
-    def _get_pool_stats(self) -> dict:
+    def get_pool_stats(self) -> dict:
         """Get connection pool stats for diagnostics."""
         try:
             return self.connection_pool.get_stats()
@@ -220,7 +235,7 @@ class ThreadMappingStore:
             logger.error(f"Failed to store mapping: {e}")
             return False
     
-    def claim_thread(self, thread_ts: str, channel_id: str) -> bool:
+    def claim_thread(self, thread_ts: str, channel_id: str) -> ClaimThreadResult:
         """
         Atomically claim a thread for ticket creation.
         
@@ -233,8 +248,7 @@ class ThreadMappingStore:
             channel_id: Slack channel ID
             
         Returns:
-            True if this request successfully claimed the thread (first),
-            False if another request already claimed it (duplicate)
+            Claim result with explicit success, duplicate, or db_error state.
         """
         try:
             with self._get_connection() as conn:
@@ -265,14 +279,14 @@ class ThreadMappingStore:
                     
                     if result is not None:
                         logger.info(f"Claimed thread {thread_ts} for ticket creation")
-                        return True
-                    else:
-                        logger.info(f"Thread {thread_ts} already claimed by another request")
-                        return False
+                        return ClaimThreadResult(status="claimed")
+
+                    logger.info(f"Thread {thread_ts} already claimed by another request")
+                    return ClaimThreadResult(status="duplicate")
             
         except Exception as e:
             logger.error(f"Failed to claim thread {thread_ts}: {e}")
-            return False
+            return ClaimThreadResult(status="db_error", error=str(e))
     
     def update_ticket_mapping(self, thread_ts: str, ticket_id: int) -> bool:
         """
@@ -308,7 +322,7 @@ class ThreadMappingStore:
             logger.error(f"Failed to update ticket mapping: {e}")
             return False
     
-    def get_ticket_id(self, thread_ts: str) -> Optional[int]:
+    def get_ticket_id(self, thread_ts: str) -> TicketLookupResult:
         """
         Retrieve Zendesk ticket ID for a given Slack thread.
         
@@ -322,8 +336,8 @@ class ThreadMappingStore:
             thread_ts: Slack thread timestamp
             
         Returns:
-            Zendesk ticket ID if found (and not a placeholder), ``None``
-            otherwise.
+            Lookup result with explicit found, not_found, placeholder, or
+            db_error state.
         """
         try:
             with self._get_connection() as conn:
@@ -335,28 +349,28 @@ class ThreadMappingStore:
                     
                     result = cursor.fetchone()
                     if not result:
-                        return None
+                        return TicketLookupResult(status="not_found")
                     ticket_id = result[0]
                     if ticket_id == -1:
                         logger.debug(
-                            "get_ticket_id(%s) found placeholder (-1); returning None",
+                            "get_ticket_id(%s) found placeholder (-1)",
                             thread_ts,
                         )
-                        return None
-                    return ticket_id
+                        return TicketLookupResult(status="placeholder")
+                    return TicketLookupResult(status="found", ticket_id=ticket_id)
                     
         except PoolTimeout as e:
             logger.error(
                 "Failed to get ticket ID for thread %s: pool timeout after %.2fs. pool_stats=%s error=%s",
                 thread_ts,
                 self.pool_acquire_timeout,
-                self._get_pool_stats(),
+                self.get_pool_stats(),
                 e
             )
-            return None
+            return TicketLookupResult(status="db_error", error=str(e))
         except Exception as e:
             logger.error(f"Failed to get ticket ID for thread {thread_ts}: {e}")
-            return None
+            return TicketLookupResult(status="db_error", error=str(e))
     
     def get_thread_info(self, ticket_id: int) -> Optional[dict]:
         """
@@ -388,7 +402,7 @@ class ThreadMappingStore:
             logger.error(f"Failed to get thread info for ticket {ticket_id}: {e}")
             return None
     
-    def is_event_processed(self, event_id: str) -> bool:
+    def is_event_processed(self, event_id: str) -> EventProcessedResult:
         """
         Check if an event has already been processed (deduplication).
         
@@ -396,7 +410,7 @@ class ThreadMappingStore:
             event_id: Slack event ID
             
         Returns:
-            True if event was already processed, False otherwise
+            Explicit processed state.
         """
         try:
             with self._get_connection() as conn:
@@ -406,11 +420,13 @@ class ThreadMappingStore:
                         WHERE event_id = %s
                     """, (event_id,))
                     
-                    return cursor.fetchone() is not None
+                    if cursor.fetchone() is not None:
+                        return EventProcessedResult(status="processed")
+                    return EventProcessedResult(status="not_processed")
                     
         except Exception as e:
             logger.error(f"Failed to check event {event_id}: {e}")
-            return False
+            return EventProcessedResult(status="db_error", error=str(e))
     
     def mark_event_processed(self, event_id: str) -> bool:
         """

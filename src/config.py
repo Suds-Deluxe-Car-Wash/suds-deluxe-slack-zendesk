@@ -21,6 +21,7 @@ class Config:
     ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
     ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
     ZENDESK_AUTOMATION_EMAIL = os.getenv("ZENDESK_AUTOMATION_EMAIL", "slack-automation@sudsdeluxecarwash.com")
+    ZENDESK_WEBHOOK_SIGNING_SECRET = os.getenv("ZENDESK_WEBHOOK_SIGNING_SECRET")
     
     # Server Configuration
     PORT = int(os.getenv("PORT", "3000"))
@@ -34,8 +35,11 @@ class Config:
     
     # Application-level concurrency gating for DB-heavy operations
     # Limits how many concurrent request handlers may perform DB work.
-    DB_MAX_CONCURRENT_REQUESTS = int(os.getenv("DB_MAX_CONCURRENT_REQUESTS", "10"))
-    DB_SEMAPHORE_ACQUIRE_TIMEOUT = int(os.getenv("DB_SEMAPHORE_ACQUIRE_TIMEOUT", "10"))
+    DB_MAX_CONCURRENT_REQUESTS = int(os.getenv("DB_MAX_CONCURRENT_REQUESTS", "1"))
+    DB_SEMAPHORE_ACQUIRE_TIMEOUT = int(os.getenv("DB_SEMAPHORE_ACQUIRE_TIMEOUT", "1"))
+    SLACK_EVENT_QUEUE_SIZE = int(os.getenv("SLACK_EVENT_QUEUE_SIZE", "100"))
+    DIAGNOSTICS_LOG_INTERVAL_SECONDS = int(os.getenv("DIAGNOSTICS_LOG_INTERVAL_SECONDS", "60"))
+
     @classmethod
     def validate(cls) -> List[str]:
         """Validate that all required configuration is present."""
