@@ -1,4 +1,5 @@
 """Thread mapping storage for Slack thread to Zendesk ticket association."""
+import json
 import os
 import logging
 import threading
@@ -35,6 +36,23 @@ class EventProcessedResult:
 class SlackEventStateResult:
     status: Literal["received", "completed", "failed", "not_found", "db_error"]
     failed_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DurableJobEnqueueResult:
+    status: Literal["created", "duplicate", "db_error"]
+    existing_status: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DurableJobClaimResult:
+    status: Literal["claimed", "not_found", "db_error"]
+    job_id: Optional[str] = None
+    job_type: Optional[str] = None
+    payload: Optional[dict] = None
+    attempts: int = 0
     error: Optional[str] = None
 
 
@@ -196,11 +214,30 @@ class ThreadMappingStore:
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
+
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS durable_jobs (
+                            job_id TEXT PRIMARY KEY,
+                            job_type TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            payload TEXT NOT NULL,
+                            attempts INTEGER NOT NULL DEFAULT 0,
+                            last_error TEXT,
+                            processing_started_at TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
                     
                     # Create index for faster lookups
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_created_at 
                         ON thread_mappings(created_at)
+                    """)
+
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_durable_jobs_status_created_at
+                        ON durable_jobs(status, created_at)
                     """)
                     
                     logger.info("PostgreSQL tables initialized successfully")
@@ -219,6 +256,7 @@ class ThreadMappingStore:
         Args:
             thread_ts: Slack thread timestamp
             ticket_id: Zendesk ticket ID
+            channel_id: Slack channel ID used if the final mapping must be inserted
             channel_id: Slack channel ID
             
         Returns:
@@ -305,7 +343,7 @@ class ThreadMappingStore:
             logger.error(f"Failed to claim thread {thread_ts}: {e}")
             return ClaimThreadResult(status="db_error", error=str(e))
     
-    def update_ticket_mapping(self, thread_ts: str, ticket_id: int) -> bool:
+    def update_ticket_mapping(self, thread_ts: str, ticket_id: int, channel_id: str = "") -> bool:
         """
         Update a claimed thread with the actual ticket ID.
         
@@ -331,9 +369,40 @@ class ThreadMappingStore:
                     if cursor.rowcount > 0:
                         logger.info(f"Updated mapping: thread_ts={thread_ts} → ticket_id={ticket_id}")
                         return True
-                    else:
-                        logger.warning(f"Failed to update mapping for {thread_ts} - no placeholder found")
+                    cursor.execute("""
+                        SELECT ticket_id
+                        FROM thread_mappings
+                        WHERE thread_ts = %s
+                    """, (thread_ts,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        existing_ticket_id = existing[0]
+                        if existing_ticket_id == ticket_id:
+                            logger.info(
+                                "Mapping already finalized for thread_ts=%s ticket_id=%s",
+                                thread_ts,
+                                ticket_id,
+                            )
+                            return True
+                        logger.warning(
+                            "Failed to finalize mapping for thread_ts=%s because existing ticket_id=%s differs",
+                            thread_ts,
+                            existing_ticket_id,
+                        )
                         return False
+
+                    logger.warning(
+                        "No placeholder found for thread_ts=%s while finalizing ticket_id=%s; inserting final mapping",
+                        thread_ts,
+                        ticket_id,
+                    )
+                    cursor.execute("""
+                        INSERT INTO thread_mappings
+                        (thread_ts, ticket_id, channel_id, created_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (thread_ts) DO NOTHING
+                    """, (thread_ts, ticket_id, channel_id, datetime.now()))
+                    return True
             
         except Exception as e:
             logger.error(f"Failed to update ticket mapping: {e}")
@@ -537,6 +606,207 @@ class ThreadMappingStore:
         except Exception as e:
             logger.error("Failed to mark Slack event failed for %s: %s", event_id, e)
             return False
+
+    @staticmethod
+    def _decode_job_payload(raw_payload: str) -> dict:
+        """Decode stored durable job payload JSON."""
+        return json.loads(raw_payload) if raw_payload else {}
+
+    def enqueue_durable_job(self, job_id: str, job_type: str, payload: dict) -> DurableJobEnqueueResult:
+        """Persist a durable background job before it is signaled in memory."""
+        try:
+            serialized_payload = json.dumps(payload)
+            now = datetime.now()
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO durable_jobs
+                        (job_id, job_type, status, payload, attempts, last_error, processing_started_at, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, 0, NULL, NULL, %s, %s)
+                        ON CONFLICT (job_id) DO NOTHING
+                    """, (job_id, job_type, "pending", serialized_payload, now, now))
+                    if cursor.rowcount > 0:
+                        return DurableJobEnqueueResult(status="created")
+
+                    cursor.execute("""
+                        SELECT status
+                        FROM durable_jobs
+                        WHERE job_id = %s
+                    """, (job_id,))
+                    existing = cursor.fetchone()
+                    return DurableJobEnqueueResult(
+                        status="duplicate",
+                        existing_status=existing[0] if existing else None,
+                    )
+        except Exception as e:
+            logger.error("Failed to enqueue durable job %s: %s", job_id, e)
+            return DurableJobEnqueueResult(status="db_error", error=str(e))
+
+    def enqueue_slack_event_job(self, event_id: str, payload: dict) -> DurableJobEnqueueResult:
+        """Atomically persist Slack event receipt and its durable job."""
+        job_id = f"slack_event:{event_id}"
+        try:
+            serialized_payload = json.dumps(payload)
+            now = datetime.now()
+            with self._get_connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            INSERT INTO slack_event_states
+                            (event_id, status, failed_reason, created_at, updated_at)
+                            VALUES (%s, %s, NULL, %s, %s)
+                            ON CONFLICT (event_id) DO NOTHING
+                            RETURNING event_id
+                        """, (event_id, "received", now, now))
+                        inserted = cursor.fetchone()
+                        if inserted is None:
+                            cursor.execute("""
+                                SELECT status
+                                FROM slack_event_states
+                                WHERE event_id = %s
+                            """, (event_id,))
+                            existing = cursor.fetchone()
+                            return DurableJobEnqueueResult(
+                                status="duplicate",
+                                existing_status=existing[0] if existing else None,
+                            )
+
+                        cursor.execute("""
+                            INSERT INTO durable_jobs
+                            (job_id, job_type, status, payload, attempts, last_error, processing_started_at, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, 0, NULL, NULL, %s, %s)
+                        """, (job_id, "slack_message_event", "pending", serialized_payload, now, now))
+                        return DurableJobEnqueueResult(status="created")
+        except Exception as e:
+            logger.error("Failed to enqueue Slack event job %s: %s", event_id, e)
+            return DurableJobEnqueueResult(status="db_error", error=str(e))
+
+    def _build_job_claim_result(self, row) -> DurableJobClaimResult:
+        """Convert a durable job row into a typed claim result."""
+        if not row:
+            return DurableJobClaimResult(status="not_found")
+        try:
+            return DurableJobClaimResult(
+                status="claimed",
+                job_id=row[0],
+                job_type=row[1],
+                payload=self._decode_job_payload(row[2]),
+                attempts=row[3] or 0,
+            )
+        except Exception as e:
+            logger.error("Failed to decode durable job payload for %s: %s", row[0], e)
+            return DurableJobClaimResult(status="db_error", error=str(e))
+
+    def claim_durable_job(self, job_id: str, stale_after_seconds: int = 120) -> DurableJobClaimResult:
+        """Claim a specific durable job if it is pending or stale-processing."""
+        stale_before = datetime.now() - timedelta(seconds=stale_after_seconds)
+        now = datetime.now()
+        try:
+            with self._get_connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE durable_jobs
+                            SET status = %s,
+                                processing_started_at = %s,
+                                updated_at = %s,
+                                attempts = attempts + 1
+                            WHERE job_id = %s
+                              AND (
+                                  status = %s
+                                  OR (status = %s AND processing_started_at < %s)
+                              )
+                            RETURNING job_id, job_type, payload, attempts
+                        """, ("processing", now, now, job_id, "pending", "processing", stale_before))
+                        return self._build_job_claim_result(cursor.fetchone())
+        except Exception as e:
+            logger.error("Failed to claim durable job %s: %s", job_id, e)
+            return DurableJobClaimResult(status="db_error", error=str(e))
+
+    def claim_next_durable_job(self, stale_after_seconds: int = 120) -> DurableJobClaimResult:
+        """Claim the next oldest durable job that is pending or stale-processing."""
+        stale_before = datetime.now() - timedelta(seconds=stale_after_seconds)
+        now = datetime.now()
+        try:
+            with self._get_connection() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            WITH next_job AS (
+                                SELECT job_id
+                                FROM durable_jobs
+                                WHERE status = %s
+                                   OR (status = %s AND processing_started_at < %s)
+                                ORDER BY created_at ASC
+                                LIMIT 1
+                                FOR UPDATE SKIP LOCKED
+                            )
+                            UPDATE durable_jobs AS jobs
+                            SET status = %s,
+                                processing_started_at = %s,
+                                updated_at = %s,
+                                attempts = jobs.attempts + 1
+                            FROM next_job
+                            WHERE jobs.job_id = next_job.job_id
+                            RETURNING jobs.job_id, jobs.job_type, jobs.payload, jobs.attempts
+                        """, ("pending", "processing", stale_before, "processing", now, now))
+                        return self._build_job_claim_result(cursor.fetchone())
+        except Exception as e:
+            logger.error("Failed to claim next durable job: %s", e)
+            return DurableJobClaimResult(status="db_error", error=str(e))
+
+    def mark_durable_job_completed(self, job_id: str) -> bool:
+        """Mark a durable background job completed."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE durable_jobs
+                        SET status = %s,
+                            last_error = NULL,
+                            processing_started_at = NULL,
+                            updated_at = %s
+                        WHERE job_id = %s
+                    """, ("completed", datetime.now(), job_id))
+            return True
+        except Exception as e:
+            logger.error("Failed to mark durable job completed for %s: %s", job_id, e)
+            return False
+
+    def mark_durable_job_failed(self, job_id: str, error_message: str) -> bool:
+        """Mark a durable background job failed."""
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE durable_jobs
+                        SET status = %s,
+                            last_error = %s,
+                            processing_started_at = NULL,
+                            updated_at = %s
+                        WHERE job_id = %s
+                    """, ("failed", (error_message or "unknown_error")[:1000], datetime.now(), job_id))
+            return True
+        except Exception as e:
+            logger.error("Failed to mark durable job failed for %s: %s", job_id, e)
+            return False
+
+    def get_durable_job_stats(self) -> dict:
+        """Return durable job counts grouped by status."""
+        stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT status, COUNT(*)
+                        FROM durable_jobs
+                        GROUP BY status
+                    """)
+                    for status, count in cursor.fetchall():
+                        stats[status] = count
+        except Exception as e:
+            stats["stats_error"] = str(e)
+        return stats
     
     def cleanup_old_mappings(self, days: int = 30) -> int:
         """
@@ -568,8 +838,27 @@ class ThreadMappingStore:
                     """, (cutoff_date,))
                     
                     deleted_events = cursor.rowcount
+
+                    cursor.execute("""
+                        DELETE FROM slack_event_states
+                        WHERE updated_at < %s AND status IN (%s, %s)
+                    """, (cutoff_date, "completed", "failed"))
+                    deleted_slack_event_states = cursor.rowcount
+
+                    cursor.execute("""
+                        DELETE FROM durable_jobs
+                        WHERE updated_at < %s AND status IN (%s, %s)
+                    """, (cutoff_date, "completed", "failed"))
+                    deleted_durable_jobs = cursor.rowcount
                     
-                    logger.info(f"Cleanup: Deleted {deleted_mappings} thread mappings and {deleted_events} processed events older than {days} days")
+                    logger.info(
+                        "Cleanup: Deleted %s thread mappings, %s processed events, %s slack event states, and %s durable jobs older than %s days",
+                        deleted_mappings,
+                        deleted_events,
+                        deleted_slack_event_states,
+                        deleted_durable_jobs,
+                        days,
+                    )
                     return deleted_mappings
                     
         except Exception as e:
@@ -594,11 +883,15 @@ class ThreadMappingStore:
 
                     cursor.execute("SELECT COUNT(*) FROM slack_event_states")
                     total_slack_event_states = cursor.fetchone()[0]
+
+                    cursor.execute("SELECT COUNT(*) FROM durable_jobs")
+                    total_durable_jobs = cursor.fetchone()[0]
                     
                     return {
                         "total_mappings": total_mappings,
                         "total_processed_events": total_events,
                         "total_slack_event_states": total_slack_event_states,
+                        "total_durable_jobs": total_durable_jobs,
                     }
                     
         except Exception as e:

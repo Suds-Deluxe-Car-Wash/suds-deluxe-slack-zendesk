@@ -122,48 +122,108 @@ def _queue_depth() -> int:
         return -1
 
 
-def _enqueue_job(job: Dict[str, Any], description: str) -> bool:
-    """Enqueue a background job without blocking the Slack request thread."""
+def _signal_job(job_id: str, description: str) -> None:
+    """Signal the in-memory worker that a durable job is ready."""
     try:
-        work_queue.put_nowait(job)
+        work_queue.put_nowait({"job_id": job_id})
         queue_depth = _queue_depth()
-        job["queue_depth"] = queue_depth
-        logger.info("Slack job enqueued job=%s queue_depth=%s", description, queue_depth)
-        return True
+        logger.info("Durable job signaled job_id=%s job=%s queue_depth=%s", job_id, description, queue_depth)
     except queue.Full:
-        logger.warning("Dropping job=%s because queue is full queue_depth=%s", description, _queue_depth())
-        return False
+        logger.warning(
+            "Durable job persisted but signal queue is full job_id=%s job=%s queue_depth=%s",
+            job_id,
+            description,
+            _queue_depth(),
+        )
 
 
-def _process_queued_job(job: Dict[str, Any]) -> None:
-    """Process one queued job."""
+def _process_queued_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Process one durable job payload."""
     job_type = job.get("job_type")
 
     if job_type == "slack_message_event":
-        slack_handler.process_message_event_job(job)
-        return
+        return slack_handler.process_message_event_job(job)
 
     if job_type == "shortcut":
-        slack_handler.process_shortcut_job(job)
-        return
+        return slack_handler.process_shortcut_job(job)
 
     logger.warning("Unknown queued job type=%s", job_type)
+    return {"success": False, "error": f"unknown_job_type:{job_type}"}
+
+
+def _claim_next_job_for_worker(job_id_hint: Optional[str] = None):
+    """Claim the next durable job for the worker, optionally preferring a hinted job."""
+    if job_id_hint:
+        claimed_job = thread_store.claim_durable_job(job_id_hint, Config.DURABLE_JOB_STALE_SECONDS)
+        if claimed_job.status == "claimed":
+            return claimed_job
+        if claimed_job.status == "db_error":
+            logger.error("Failed to claim durable job from hint job_id=%s error=%s", job_id_hint, claimed_job.error)
+
+    claimed_job = thread_store.claim_next_durable_job(Config.DURABLE_JOB_STALE_SECONDS)
+    if claimed_job.status == "db_error":
+        logger.error("Failed to claim next durable job error=%s", claimed_job.error)
+        return None
+    if claimed_job.status == "claimed":
+        return claimed_job
+    return None
 
 
 def _slack_job_worker() -> None:
     """Serial Slack/Zendesk worker to keep DB pressure bounded."""
-    logger.info("Slack job worker started queue_size=%s", Config.SLACK_EVENT_QUEUE_SIZE)
+    logger.info(
+        "Slack job worker started queue_size=%s durable_job_stats=%s",
+        Config.SLACK_EVENT_QUEUE_SIZE,
+        thread_store.get_durable_job_stats(),
+    )
     while True:
-        job = work_queue.get()
+        queued_signal = None
+        claimed_job = None
         try:
-            _process_queued_job(job)
+            try:
+                queued_signal = work_queue.get(timeout=Config.DURABLE_JOB_POLL_INTERVAL_SECONDS)
+            except queue.Empty:
+                queued_signal = None
+
+            job_id_hint = queued_signal.get("job_id") if queued_signal else None
+            claimed_job = _claim_next_job_for_worker(job_id_hint)
+            if claimed_job is None:
+                continue
+
+            job = claimed_job.payload or {}
+            job["job_id"] = claimed_job.job_id
+            job.setdefault("job_type", claimed_job.job_type)
+            job["queue_depth"] = _queue_depth()
+            logger.info(
+                "Durable job claimed job_id=%s job_type=%s attempts=%s queue_depth=%s",
+                claimed_job.job_id,
+                claimed_job.job_type,
+                claimed_job.attempts,
+                _queue_depth(),
+            )
+
+            result = _process_queued_job(job)
+            if result.get("success"):
+                if not thread_store.mark_durable_job_completed(claimed_job.job_id):
+                    logger.error("Failed to mark durable job completed job_id=%s", claimed_job.job_id)
+            else:
+                if not thread_store.mark_durable_job_failed(
+                    claimed_job.job_id,
+                    result.get("error") or "job_failed",
+                ):
+                    logger.error("Failed to mark durable job failed job_id=%s", claimed_job.job_id)
         except Exception as exc:
-            slack_event_id = job.get("slack_event_id")
+            slack_event_id = None
+            if claimed_job and claimed_job.payload:
+                slack_event_id = claimed_job.payload.get("slack_event_id")
             if slack_event_id:
                 thread_store.mark_slack_event_failed(slack_event_id, f"worker_exception:{exc}")
+            if claimed_job and claimed_job.job_id:
+                thread_store.mark_durable_job_failed(claimed_job.job_id, f"worker_exception:{exc}")
             logger.error("Unhandled error in Slack job worker: %s", exc, exc_info=True)
         finally:
-            work_queue.task_done()
+            if queued_signal is not None:
+                work_queue.task_done()
 
 
 def _diagnostics_worker() -> None:
@@ -176,10 +236,11 @@ def _diagnostics_worker() -> None:
         time.sleep(Config.DIAGNOSTICS_LOG_INTERVAL_SECONDS)
         worker_alive = _slack_worker_thread.is_alive() if _slack_worker_thread else False
         logger.info(
-            "Runtime diagnostics queue_depth=%s worker_alive=%s db_pool_stats=%s",
+            "Runtime diagnostics queue_depth=%s worker_alive=%s db_pool_stats=%s durable_job_stats=%s",
             _queue_depth(),
             worker_alive,
             thread_store.get_pool_stats(),
+            thread_store.get_durable_job_stats(),
         )
 
 
@@ -215,12 +276,18 @@ def start_background_tasks() -> None:
 
 @bolt_app.shortcut("create_custom_zendesk_ticket")
 def handle_create_ticket_shortcut(ack, shortcut, client):
-    """Queue the shortcut request and acknowledge immediately."""
-    ack()
-
+    """Persist and signal the shortcut request before returning control to Slack."""
     user_id = shortcut.get("user", {}).get("id")
     channel_id = shortcut.get("channel", {}).get("id")
     message_ts = shortcut.get("message", {}).get("ts")
+    trigger_id = shortcut.get("trigger_id") or f"{channel_id}:{message_ts}:{user_id}:{time.time_ns()}"
+    job_id = f"shortcut:{trigger_id}"
+    durable_job = {
+        "job_id": job_id,
+        "job_type": "shortcut",
+        "shortcut": shortcut,
+        "enqueued_at": time.time(),
+    }
 
     logger.info(
         "Received message shortcut user_id=%s channel_id=%s message_ts=%s",
@@ -229,24 +296,32 @@ def handle_create_ticket_shortcut(ack, shortcut, client):
         message_ts,
     )
 
-    enqueued = _enqueue_job(
-        {
-            "job_type": "shortcut",
-            "shortcut": shortcut,
-            "enqueued_at": time.time(),
-        },
-        f"shortcut user_id={user_id} channel_id={channel_id} message_ts={message_ts}",
-    )
+    enqueue_result = thread_store.enqueue_durable_job(job_id, "shortcut", durable_job)
+    ack()
 
-    if not enqueued and channel_id and user_id:
+    if enqueue_result.status == "db_error" and channel_id and user_id:
         try:
             client.chat_postEphemeral(
                 channel=channel_id,
                 user=user_id,
-                text="The ticket queue is full right now. Please try again in a moment.",
+                text="The ticket request could not be saved right now. Please try again in a moment.",
             )
         except Exception as exc:
-            logger.error("Failed to notify shortcut user about full queue: %s", exc)
+            logger.error("Failed to notify shortcut user about durable queue error: %s", exc)
+        return
+
+    if enqueue_result.status == "created":
+        _signal_job(
+            job_id,
+            f"shortcut user_id={user_id} channel_id={channel_id} message_ts={message_ts}",
+        )
+        return
+
+    if enqueue_result.status == "duplicate" and enqueue_result.existing_status in {"pending", "processing"}:
+        _signal_job(
+            job_id,
+            f"shortcut retry user_id={user_id} channel_id={channel_id} message_ts={message_ts}",
+        )
 
 def _is_workflow_message(event: dict) -> bool:
     """
@@ -412,31 +487,38 @@ def slack_events():
         )
         return _timed_json_response({"ok": True, "ignored": True}, 200, "/slack/events", started_at)
 
-    existing_state = thread_store.get_slack_event_state(slack_event_id)
-    if existing_state.status == "db_error":
+    durable_job = {
+        "job_id": f"slack_event:{slack_event_id}",
+        "job_type": "slack_message_event",
+        "event_kind": event_kind,
+        "slack_event_id": slack_event_id,
+        "event": event,
+        "enqueued_at": time.time(),
+    }
+    enqueue_result = thread_store.enqueue_slack_event_job(slack_event_id, durable_job)
+    if enqueue_result.status == "db_error":
         logger.error(
-            "Failed to read Slack ingress dedupe state slack_event_id=%s error=%s",
+            "Failed to persist Slack ingress event slack_event_id=%s error=%s",
             slack_event_id,
-            existing_state.error,
+            enqueue_result.error,
         )
         return _timed_json_response({"error": "Event state unavailable"}, 500, "/slack/events", started_at)
 
-    if existing_state.status in {"completed", "received", "failed"}:
+    if enqueue_result.status == "duplicate":
         logger.info(
             "Skipping duplicate Slack event at ingress slack_event_id=%s state=%s",
             slack_event_id,
-            existing_state.status,
+            enqueue_result.existing_status,
         )
+        if enqueue_result.existing_status in {"received"}:
+            _signal_job(
+                durable_job["job_id"],
+                (
+                    f"{event_kind} duplicate slack_event_id={slack_event_id} "
+                    f"message_ts={event.get('ts')} thread_ts={event.get('thread_ts')}"
+                ),
+            )
         return _timed_json_response({"ok": True, "duplicate": True}, 200, "/slack/events", started_at)
-
-    state = thread_store.record_slack_event_received(slack_event_id)
-    if state.status == "db_error":
-        logger.error(
-            "Failed to persist Slack ingress dedupe state slack_event_id=%s error=%s",
-            slack_event_id,
-            state.error,
-        )
-        return _timed_json_response({"error": "Event state unavailable"}, 500, "/slack/events", started_at)
 
     logger.info(
         "Accepted Slack event slack_event_id=%s event_kind=%s message_ts=%s thread_ts=%s retry_num=%s retry_reason=%s",
@@ -447,24 +529,13 @@ def slack_events():
         retry_num,
         retry_reason,
     )
-
-    enqueued = _enqueue_job(
-        {
-            "job_type": "slack_message_event",
-            "event_kind": event_kind,
-            "slack_event_id": slack_event_id,
-            "event": event,
-            "enqueued_at": time.time(),
-        },
+    _signal_job(
+        durable_job["job_id"],
         (
             f"{event_kind} slack_event_id={slack_event_id} "
             f"message_ts={event.get('ts')} thread_ts={event.get('thread_ts')}"
         ),
     )
-    if not enqueued:
-        thread_store.mark_slack_event_failed(slack_event_id, "queue_full")
-        return _timed_json_response({"ok": True, "queued": False}, 200, "/slack/events", started_at)
-
     return _timed_json_response({"ok": True, "queued": True}, 200, "/slack/events", started_at)
 
 
@@ -551,6 +622,7 @@ def diagnostics():
             "queue_depth": _queue_depth(),
             "worker_alive": _slack_worker_thread.is_alive() if _slack_worker_thread else False,
             "db_pool_stats": thread_store.get_pool_stats(),
+            "durable_job_stats": thread_store.get_durable_job_stats(),
         }
     ), 200
 

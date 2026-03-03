@@ -39,6 +39,8 @@ class Config:
     DB_SEMAPHORE_ACQUIRE_TIMEOUT = int(os.getenv("DB_SEMAPHORE_ACQUIRE_TIMEOUT", "1"))
     SLACK_EVENT_QUEUE_SIZE = int(os.getenv("SLACK_EVENT_QUEUE_SIZE", "100"))
     DIAGNOSTICS_LOG_INTERVAL_SECONDS = int(os.getenv("DIAGNOSTICS_LOG_INTERVAL_SECONDS", "60"))
+    DURABLE_JOB_POLL_INTERVAL_SECONDS = float(os.getenv("DURABLE_JOB_POLL_INTERVAL_SECONDS", "1"))
+    DURABLE_JOB_STALE_SECONDS = int(os.getenv("DURABLE_JOB_STALE_SECONDS", "120"))
 
     @classmethod
     def validate(cls) -> List[str]:

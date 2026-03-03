@@ -45,7 +45,7 @@ class SlackHandler:
 
         return "Failed to create ticket. Please try again."
 
-    def process_message_event_job(self, job: Dict[str, Any]) -> None:
+    def process_message_event_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         """Process a queued Slack message event serially."""
         event = job["event"]
         slack_event_id = job.get("slack_event_id")
@@ -135,17 +135,24 @@ class SlackHandler:
                 queue_depth,
                 failure_reason,
             )
+        return {"success": success, "error": failure_reason}
 
-    def process_shortcut_job(self, job: Dict[str, Any]) -> None:
+    def process_shortcut_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         """Process a queued shortcut and notify the requesting user."""
         payload = job["shortcut"]
         channel_id = payload.get("channel", {}).get("id")
         user_id = payload.get("user", {}).get("id")
         result = self.handle_message_shortcut(payload)
+        success = result.get("success", False)
+        failure_reason = result.get("error") or result.get("reason") or "shortcut_failed"
+
+        if result.get("duplicate_prevented") and result.get("reason") == "creation_in_progress":
+            success = False
+            failure_reason = "creation_in_progress"
 
         if not channel_id or not user_id:
             logger.warning("Shortcut job missing user/channel context")
-            return
+            return {"success": False, "error": "missing_user_or_channel"}
 
         if result.get("success"):
             if result.get("duplicate_prevented"):
@@ -168,6 +175,7 @@ class SlackHandler:
             self.client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
         except SlackApiError as e:
             logger.error("Failed to post shortcut status message: %s", e.response["error"])
+        return {"success": success, "error": failure_reason}
     
     def handle_workflow_message(self, message: Dict[str, Any], channel_id: str, user_id: str = None) -> Dict[str, Any]:
         """
@@ -304,7 +312,18 @@ class SlackHandler:
                     "error": f"Failed to create ticket: {ticket_result.get('error', 'Unknown error')}"
                 }
 
-            # Post ticket link back to Slack thread
+            # Update the claimed thread with the actual ticket ID
+            if message_ts:
+                updated = self.thread_store.update_ticket_mapping(
+                    thread_ts=message_ts,
+                    ticket_id=ticket_result["ticket_id"],
+                    channel_id=channel_id,
+                )
+
+                if not updated:
+                    logger.error(f"Failed to update ticket mapping for {message_ts} - this should not happen!")
+
+            # Post ticket link back to Slack thread after the mapping is durable
             self.post_ticket_link_to_thread(
                 channel_id=channel_id,
                 thread_ts=message.get("ts"),
@@ -312,16 +331,6 @@ class SlackHandler:
                 ticket_url=ticket_result["ticket_url"],
                 user_id=user_id
             )
-
-            # Update the claimed thread with the actual ticket ID
-            if message_ts:
-                updated = self.thread_store.update_ticket_mapping(
-                    thread_ts=message_ts,
-                    ticket_id=ticket_result["ticket_id"]
-                )
-
-                if not updated:
-                    logger.error(f"Failed to update ticket mapping for {message_ts} - this should not happen!")
 
             logger.info(f"Successfully created ticket #{ticket_result['ticket_id']} from Slack workflow using form '{form_config['name']}'")
 
