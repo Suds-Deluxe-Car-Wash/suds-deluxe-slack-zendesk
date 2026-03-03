@@ -3,7 +3,9 @@ import base64
 import hashlib
 import hmac
 import json
+import atexit
 import logging
+import logging.handlers
 import queue
 import sys
 import threading
@@ -21,12 +23,24 @@ from src.slack_log_alert_handler import SlackLogAlertHandler
 from src.thread_store import ThreadMappingStore
 from src.zendesk_webhook_handler import ZendeskWebhookHandler
 
-# Configure logging
+# Configure logging with a QueueHandler so only one dedicated thread writes
+# to stdout. Python 3.13's BufferedWriter is not reentrant-safe; putting a
+# QueueListener between the root logger and StreamHandler serialises all
+# writes and eliminates the "reentrant call inside <_io.BufferedWriter>" crash.
+_log_queue = queue.SimpleQueue()
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+)
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.handlers.QueueHandler(_log_queue)],
 )
+_log_listener = logging.handlers.QueueListener(
+    _log_queue, _stream_handler, respect_handler_level=True
+)
+_log_listener.start()
+atexit.register(_log_listener.stop)
 logger = logging.getLogger(__name__)
 
 _background_lock = threading.Lock()
