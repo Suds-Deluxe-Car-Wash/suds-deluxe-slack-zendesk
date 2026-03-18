@@ -54,6 +54,7 @@ _background_lock = threading.Lock()
 _slack_worker_thread = None
 _diagnostics_thread = None
 _cleanup_thread = None
+_missed_ticket_thread = None
 
 
 def configure_slack_log_alerts():
@@ -314,9 +315,75 @@ def _cleanup_worker() -> None:
             logger.error("Error in monthly cleanup task: %s", exc, exc_info=True)
 
 
+def _missed_ticket_worker() -> None:
+    """Scan monitored channels for workflow messages with no Zendesk ticket."""
+    from slack_sdk import WebClient as _WebClient
+    client = _WebClient(token=Config.SLACK_BOT_TOKEN)
+    interval = Config.MISSED_TICKET_CHECK_INTERVAL_SECONDS
+    lookback = Config.MISSED_TICKET_LOOKBACK_SECONDS
+    logger.info("Missed-ticket checker started interval=%ss lookback=%ss", interval, lookback)
+    time.sleep(120)  # let the app fully warm up first
+    while True:
+        try:
+            oldest = time.time() - lookback
+            for channel_id in get_allowed_channel_ids():
+                _check_channel_for_missed_tickets(client, channel_id, oldest)
+        except Exception:
+            logger.exception("Missed-ticket checker error")
+        time.sleep(interval)
+
+
+def _check_channel_for_missed_tickets(client, channel_id: str, oldest: float) -> None:
+    """Check one channel for workflow messages without Zendesk tickets."""
+    cursor = None
+    found = queued = 0
+    while True:
+        kwargs = {"channel": channel_id, "oldest": str(oldest), "limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_history(**kwargs)
+        except Exception:
+            logger.warning("conversations_history failed channel=%s", channel_id, exc_info=True)
+            return
+
+        for msg in resp.get("messages", []):
+            # Only top-level messages (not thread replies)
+            if msg.get("thread_ts") and msg["thread_ts"] != msg["ts"]:
+                continue
+            if not _is_workflow_message(msg):
+                continue
+            found += 1
+            result = thread_store.get_ticket_id(msg["ts"])
+            if result.status in ("found", "placeholder"):
+                continue
+            # No ticket — enqueue a synthetic job
+            event_id = f"missed:{channel_id}:{msg['ts']}"
+            payload = {
+                "job_type": "slack_message_event",
+                "event_kind": "workflow_message",
+                "slack_event_id": event_id,
+                "event": {**msg, "channel": channel_id},
+                "enqueued_at": time.time(),
+            }
+            enqueue_result = thread_store.enqueue_slack_event_job(event_id, payload)
+            if enqueue_result.status == "created":
+                queued += 1
+                _signal_job(event_id)
+                logger.info("Missed ticket re-queued channel=%s ts=%s", channel_id, msg["ts"])
+
+        next_cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = next_cursor
+
+    if found:
+        logger.info("Missed-ticket scan complete channel=%s forms_found=%s re_queued=%s", channel_id, found, queued)
+
+
 def start_background_tasks() -> None:
     """Start queue, diagnostics, and cleanup threads once per process."""
-    global _slack_worker_thread, _diagnostics_thread, _cleanup_thread
+    global _slack_worker_thread, _diagnostics_thread, _cleanup_thread, _missed_ticket_thread
 
     with _background_lock:
         if _slack_worker_thread is None or not _slack_worker_thread.is_alive():
@@ -330,6 +397,10 @@ def start_background_tasks() -> None:
         if _cleanup_thread is None or not _cleanup_thread.is_alive():
             _cleanup_thread = threading.Thread(target=_cleanup_worker, daemon=True)
             _cleanup_thread.start()
+
+        if _missed_ticket_thread is None or not _missed_ticket_thread.is_alive():
+            _missed_ticket_thread = threading.Thread(target=_missed_ticket_worker, daemon=True)
+            _missed_ticket_thread.start()
 
 
 @bolt_app.shortcut("create_custom_zendesk_ticket")
