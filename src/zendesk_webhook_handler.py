@@ -139,8 +139,16 @@ class ZendeskWebhookHandler:
                 return
 
             author_name = comment_obj.get("author_name", "") or comment_obj.get("author", {}).get("name", "")
-            if author_name == "Slack Automation":
-                logger.info("Skipping comment from Slack Automation (loop prevention) author_name=%s", author_name)
+            author_email = comment_obj.get("author_email", "") or (
+                comment_obj.get("author", {}).get("email")
+                if isinstance(comment_obj.get("author"), dict)
+                else ""
+            )
+            # Match on email, not the free-text display name: any Zendesk user can be
+            # named "Slack Automation" (e.g. a dev/test agent account), and a name
+            # collision must not cause loop-prevention to swallow real agent replies.
+            if author_email and author_email == Config.ZENDESK_AUTOMATION_EMAIL:
+                logger.info("Skipping comment from Slack Automation requester (loop prevention) author_email=%s", author_email)
                 return
 
             body = (
@@ -173,11 +181,6 @@ class ZendeskWebhookHandler:
                 return
 
             if is_public:
-                author_email = comment_obj.get("author_email", "") or (
-                    comment_obj.get("author", {}).get("email")
-                    if isinstance(comment_obj.get("author"), dict)
-                    else ""
-                )
                 if author_email:
                     prefix = f"Comment from {author_display} ({author_email}):\n"
                 else:
