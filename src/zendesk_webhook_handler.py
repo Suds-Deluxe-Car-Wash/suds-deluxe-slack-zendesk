@@ -37,10 +37,19 @@ class ZendeskWebhookHandler:
 
             messages = self._parse_webhook_event(payload)
             if not messages:
-                logger.debug(
-                    "No messages to post for ticket #%s zendesk_invocation_id=%s",
+                comment_keys_present = [
+                    key for key in ("current_comment", "comment", "audit", "audits", "event", "ticket_audit")
+                    if payload.get(key)
+                ]
+                ticket_payload = payload.get("ticket")
+                logger.info(
+                    "No messages to post for ticket #%s zendesk_invocation_id=%s "
+                    "payload_top_level_keys=%s comment_keys_present=%s ticket_has_comment=%s",
                     ticket_id,
                     invocation_id,
+                    sorted(payload.keys()),
+                    comment_keys_present,
+                    bool(isinstance(ticket_payload, dict) and ticket_payload.get("comment")),
                 )
                 return {"success": True, "skipped": True}
 
@@ -131,7 +140,7 @@ class ZendeskWebhookHandler:
 
             author_name = comment_obj.get("author_name", "") or comment_obj.get("author", {}).get("name", "")
             if author_name == "Slack Automation":
-                logger.debug("Skipping comment from Slack Automation (loop prevention)")
+                logger.info("Skipping comment from Slack Automation (loop prevention) author_name=%s", author_name)
                 return
 
             body = (
@@ -144,7 +153,7 @@ class ZendeskWebhookHandler:
                 body = str(body)
 
             if "[Posted from Slack]" in body:
-                logger.debug("Skipping comment from Slack thread (loop prevention)")
+                logger.info("Skipping comment from Slack thread (loop prevention)")
                 return
 
             is_public = comment_obj.get("public", True)
