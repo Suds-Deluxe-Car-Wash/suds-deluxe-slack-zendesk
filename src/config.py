@@ -18,8 +18,9 @@ class Config:
     
     # Zendesk Configuration
     ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
-    ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
-    ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
+    ZENDESK_OAUTH_CLIENT_ID = os.getenv("ZENDESK_OAUTH_CLIENT_ID")
+    ZENDESK_OAUTH_CLIENT_SECRET = os.getenv("ZENDESK_OAUTH_CLIENT_SECRET")
+    ZENDESK_OAUTH_SCOPE = os.getenv("ZENDESK_OAUTH_SCOPE", "tickets:read tickets:write users:read")
     ZENDESK_AUTOMATION_EMAIL = os.getenv("ZENDESK_AUTOMATION_EMAIL", "slack-automation@sudsdeluxecarwash.com")
     ZENDESK_WEBHOOK_SIGNING_SECRET = os.getenv("ZENDESK_WEBHOOK_SIGNING_SECRET")
     
@@ -52,8 +53,8 @@ class Config:
             "SLACK_BOT_TOKEN",
             "SLACK_SIGNING_SECRET",
             "ZENDESK_SUBDOMAIN",
-            "ZENDESK_EMAIL",
-            "ZENDESK_API_TOKEN"
+            "ZENDESK_OAUTH_CLIENT_ID",
+            "ZENDESK_OAUTH_CLIENT_SECRET"
         ]
         
         for var in required_vars:

@@ -1,7 +1,9 @@
 """Zendesk ticket creation and management."""
 import logging
 import re
+import time
 from typing import Dict, Any, Optional
+import requests
 from zenpy import Zenpy
 from zenpy.lib.api_objects import Ticket, CustomField, Comment, User
 from src.config import Config
@@ -11,15 +13,17 @@ logger = logging.getLogger(__name__)
 
 class ZendeskHandler:
     """Handles Zendesk API interactions for ticket creation."""
-    
+
+    # Refresh the OAuth access token this many seconds before it actually
+    # expires, so an in-flight request never races an expiring token.
+    TOKEN_REFRESH_BUFFER_SECONDS = 60
+
     def __init__(self):
-        """Initialize Zendesk client with credentials from config."""
+        """Initialize Zendesk client using an OAuth client_credentials token."""
+        self._oauth_client: Optional[Zenpy] = None
+        self._oauth_token_expiry: float = 0
         try:
-            self.client = Zenpy(
-                subdomain=Config.ZENDESK_SUBDOMAIN,
-                email=Config.ZENDESK_EMAIL,
-                token=Config.ZENDESK_API_TOKEN
-            )
+            self._refresh_client()
             # Import WebClient for user name resolution
             from slack_sdk import WebClient
             self.slack_client = WebClient(token=Config.SLACK_BOT_TOKEN)
@@ -27,6 +31,35 @@ class ZendeskHandler:
         except Exception as e:
             logger.error(f"Failed to initialize Zendesk client: {e}")
             raise
+
+    @property
+    def client(self) -> Zenpy:
+        """Zenpy client, transparently refreshed when its OAuth token is near expiry."""
+        if self._oauth_client is None or time.time() >= self._oauth_token_expiry:
+            self._refresh_client()
+        return self._oauth_client
+
+    def _refresh_client(self) -> None:
+        """Fetch a fresh OAuth access token via the client_credentials grant and rebuild the client."""
+        response = requests.post(
+            f"https://{Config.ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens",
+            json={
+                "grant_type": "client_credentials",
+                "client_id": Config.ZENDESK_OAUTH_CLIENT_ID,
+                "client_secret": Config.ZENDESK_OAUTH_CLIENT_SECRET,
+                "scope": Config.ZENDESK_OAUTH_SCOPE,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        self._oauth_token_expiry = (
+            time.time() + token_data.get("expires_in", 3600) - self.TOKEN_REFRESH_BUFFER_SECONDS
+        )
+        self._oauth_client = Zenpy(
+            subdomain=Config.ZENDESK_SUBDOMAIN,
+            oauth_token=token_data["access_token"],
+        )
     
     def create_ticket_from_slack_message(
         self,

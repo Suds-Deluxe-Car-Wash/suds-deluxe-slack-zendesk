@@ -91,8 +91,9 @@ SLACK_SIGNING_SECRET=your-signing-secret
 
 # Zendesk Configuration
 ZENDESK_SUBDOMAIN=yourcompany
-ZENDESK_EMAIL=admin@yourcompany.com
-ZENDESK_API_TOKEN=your-api-token
+ZENDESK_OAUTH_CLIENT_ID=your-oauth-client-identifier
+ZENDESK_OAUTH_CLIENT_SECRET=your-oauth-client-secret
+ZENDESK_OAUTH_SCOPE=tickets:read tickets:write users:read
 ZENDESK_AUTOMATION_EMAIL=slack-automation@yourcompany.com
 ZENDESK_WEBHOOK_SIGNING_SECRET=your-zendesk-webhook-signing-secret
 
